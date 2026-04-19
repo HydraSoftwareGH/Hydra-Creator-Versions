@@ -1,0 +1,2755 @@
+import tkinter as tk
+from tkinter import scrolledtext, messagebox, simpledialog, filedialog, ttk
+import pyperclip
+import re
+import threading
+import json
+import os
+import sys
+import io
+import contextlib
+import subprocess
+import tempfile
+import shutil
+from cryptography.fernet import Fernet
+from datetime import datetime
+from pathlib import Path
+
+# ==================================================
+# 🛠️ UTILIDAD PARA PYINSTALLER (Rutas Temporales)
+# ==================================================
+def resource_path(relative_path):
+    """ 
+    Obtiene la ruta absoluta del recurso para que funcione 
+    tanto en desarrollo como dentro del archivo .EXE
+    """
+    try:
+        # PyInstaller crea una carpeta temporal en _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+# ==================================================
+# 📁 APPDATA (RUTAS SEGURAS PARA DATOS DE USUARIO)
+# ==================================================
+
+def get_appdata_path():
+    if os.name == "nt":
+        base = os.getenv("APPDATA")  # Windows
+    else:
+        base = os.path.expanduser("~/.config")  # Linux/Mac
+
+    path = os.path.join(base, "HydraIA")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+APPDATA_DIR = get_appdata_path()
+
+# ==================================================
+# GESTIÓN DE ARCHIVOS DE CONFIGURACIÓN (EN APPDATA)
+# ==================================================
+
+CONFIG_FILE = os.path.join(APPDATA_DIR, "hydra_config.json")
+KEY_FILE = os.path.join(APPDATA_DIR, "hydra.key")
+HISTORIAL_FILE = os.path.join(APPDATA_DIR, "hydra_historial.json")
+PROYECTOS_FILE = os.path.join(APPDATA_DIR, "hydra_proyectos.json")
+FIRST_RUN_FLAG = os.path.join(APPDATA_DIR, "hydra_first_run.flag")
+
+def generar_clave():
+    if not os.path.exists(KEY_FILE):
+        clave = Fernet.generate_key()
+        with open(KEY_FILE, "wb") as f:
+            f.write(clave)
+    with open(KEY_FILE, "rb") as f:
+        return f.read()
+
+def encriptar(texto, clave):
+    if not texto:
+        return ""
+    f = Fernet(clave)
+    return f.encrypt(texto.encode()).decode()
+
+def desencriptar(texto_encriptado, clave):
+    if not texto_encriptado:
+        return None
+    try:
+        f = Fernet(clave)
+        return f.decrypt(texto_encriptado.encode()).decode()
+    except Exception as e:
+        print(f"Error al desencriptar: {e}")
+        return None
+
+def guardar_configuracion_chat(chat_id, proveedor, modelo, api_key, emocion="Neutral", proposito="General", nombre=None):
+    clave = generar_clave()
+    config = {}
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, "r") as f:
+            config = json.load(f)
+    
+    if nombre is None:
+        if chat_id in config and "nombre" in config[chat_id]:
+            nombre = config[chat_id]["nombre"]
+        else:
+            nombre = f"Chat {chat_id[:8]}"
+    
+    config[chat_id] = {
+        "proveedor": proveedor,
+        "modelo": modelo,
+        "api_key": encriptar(api_key, clave),
+        "nombre": nombre,
+        "emocion": emocion,
+        "proposito": proposito,
+        "fecha_creacion": datetime.now().isoformat(),
+        "fecha_ultimo_uso": datetime.now().isoformat()
+    }
+    
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+
+def cargar_configuracion_chat(chat_id):
+    if not os.path.exists(CONFIG_FILE):
+        return None
+    
+    clave = generar_clave()
+    with open(CONFIG_FILE, "r") as f:
+        config = json.load(f)
+    
+    if chat_id not in config:
+        return None
+    
+    data = config[chat_id].copy()
+    if "api_key" in data and data["api_key"]:
+        api_key_desencriptada = desencriptar(data["api_key"], clave)
+        if api_key_desencriptada is None:
+            return None
+        data["api_key"] = api_key_desencriptada
+    else:
+        data["api_key"] = None
+    
+    if "emocion" not in data:
+        data["emocion"] = "Neutral"
+    if "proposito" not in data:
+        data["proposito"] = "General"
+    if "nombre" not in data:
+        data["nombre"] = f"Chat {chat_id[:8]}"
+    if "modelo" not in data:
+        data["modelo"] = PROVEEDORES.get(data["proveedor"], {}).get("default_model", "gemini-2.5-flash")
+    
+    return data
+
+def obtener_todos_chats():
+    if not os.path.exists(CONFIG_FILE):
+        return {}
+    with open(CONFIG_FILE, "r") as f:
+        return json.load(f)
+
+def obtener_chat_mas_reciente():
+    chats = obtener_todos_chats()
+    if not chats:
+        return None
+    
+    chats_ordenados = sorted(
+        chats.items(),
+        key=lambda x: x[1].get("fecha_ultimo_uso", x[1].get("fecha_creacion", "0")),
+        reverse=True
+    )
+    
+    if chats_ordenados:
+        return chats_ordenados[0][0]
+    return None
+
+def actualizar_fecha_uso_chat(chat_id):
+    if not os.path.exists(CONFIG_FILE):
+        return
+    
+    with open(CONFIG_FILE, "r") as f:
+        config = json.load(f)
+    
+    if chat_id in config:
+        config[chat_id]["fecha_ultimo_uso"] = datetime.now().isoformat()
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(config, f, indent=2)
+
+def guardar_historial(chat_id, historial):
+    data = {}
+    if os.path.exists(HISTORIAL_FILE):
+        with open(HISTORIAL_FILE, "r") as f:
+            data = json.load(f)
+    
+    data[chat_id] = historial
+    
+    with open(HISTORIAL_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def cargar_historial(chat_id):
+    if not os.path.exists(HISTORIAL_FILE):
+        return []
+    
+    with open(HISTORIAL_FILE, "r") as f:
+        data = json.load(f)
+    
+    return data.get(chat_id, [])
+
+# ==================================================
+# GESTIÓN DE PROYECTOS
+# ==================================================
+
+def guardar_proyectos(proyectos):
+    with open(PROYECTOS_FILE, "w") as f:
+        json.dump(proyectos, f, indent=2)
+
+def cargar_proyectos():
+    if not os.path.exists(PROYECTOS_FILE):
+        return {}
+    with open(PROYECTOS_FILE, "r") as f:
+        return json.load(f)
+
+LENGUAJES_CONFIG = {
+    "python": {
+        "extension": ".py",
+        "icono": "🐍",
+        "comandos": {
+            "ejecutar": "python {archivo}",
+            "compilar": None,
+            "exe": "pyinstaller --onefile {archivo}",
+            "terminal": "python",
+            "pip": "pip"
+        }
+    },
+    "javascript": {
+        "extension": ".js",
+        "icono": "📜",
+        "comandos": {
+            "ejecutar": "node {archivo}",
+            "compilar": None,
+            "exe": None,
+            "terminal": "node",
+            "npm": "npm"
+        }
+    },
+    "html": {
+        "extension": ".html",
+        "icono": "🌐",
+        "comandos": {
+            "ejecutar": "start {archivo}",
+            "compilar": None,
+            "exe": None,
+            "terminal": None
+        }
+    },
+    "cpp": {
+        "extension": ".cpp",
+        "icono": "⚙️",
+        "comandos": {
+            "ejecutar": "{archivo_sin_ext}",
+            "compilar": "g++ {archivo} -o {archivo_sin_ext}",
+            "exe": None,
+            "terminal": "g++"
+        }
+    },
+    "java": {
+        "extension": ".java",
+        "icono": "☕",
+        "comandos": {
+            "ejecutar": "java {nombre_clase}",
+            "compilar": "javac {archivo}",
+            "exe": None,
+            "terminal": "java"
+        }
+    },
+    "csharp": {
+        "extension": ".cs",
+        "icono": "🔷",
+        "comandos": {
+            "ejecutar": "dotnet run",
+            "compilar": "csc {archivo}",
+            "exe": None,
+            "terminal": "dotnet"
+        }
+    },
+    "go": {
+        "extension": ".go",
+        "icono": "🏃",
+        "comandos": {
+            "ejecutar": "go run {archivo}",
+            "compilar": "go build -o {archivo_sin_ext} {archivo}",
+            "exe": None,
+            "terminal": "go"
+        }
+    },
+    "rust": {
+        "extension": ".rs",
+        "icono": "🦀",
+        "comandos": {
+            "ejecutar": "cargo run",
+            "compilar": "rustc {archivo} -o {archivo_sin_ext}",
+            "exe": None,
+            "terminal": "cargo"
+        }
+    }
+}
+
+PROVEEDORES = {
+    "gemini": {
+        "nombre": "Google Gemini",
+        "modelos": ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"],
+        "default_model": "gemini-2.5-flash"
+    },
+    "openai": {
+        "nombre": "OpenAI GPT",
+        "modelos": ["gpt-4", "gpt-4-turbo", "gpt-3.5-turbo"],
+        "default_model": "gpt-3.5-turbo"
+    },
+    "groq": {
+        "nombre": "Groq (Rápido)",
+        "modelos": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
+        "default_model": "llama-3.3-70b-versatile"
+    },
+    "claude": {
+        "nombre": "Anthropic Claude",
+        "modelos": ["claude-3-haiku-20240307"],
+        "default_model": "claude-3-haiku-20240307"
+    },
+    "deepseek": {
+        "nombre": "DeepSeek",
+        "modelos": ["deepseek-chat", "deepseek-coder"],
+        "default_model": "deepseek-chat"
+    }
+}
+
+# ==================================================
+# CLIENTES DE IA (Multi-proveedor)
+# ==================================================
+
+class IAClient:
+    def __init__(self, proveedor, api_key, modelo=None):
+        self.proveedor = proveedor
+        self.api_key = api_key
+        self.modelo = modelo or PROVEEDORES[proveedor]["default_model"]
+        
+    def enviar_mensaje_con_historial(self, mensaje, historial, emocion, proposito):
+        if not self.api_key:
+            return f"Error: No hay API Key configurada para {self.proveedor}."
+        
+        historial_texto = ""
+        for msg in historial[-10:]:
+            if msg["rol"] == "usuario":
+                historial_texto += f"Usuario: {msg['texto']}\n"
+            else:
+                historial_texto += f"Asistente: {msg['texto']}\n"
+        
+        mensaje_completo = f"""
+Actúa como una IA {emocion} especializada en {proposito}.
+Responde de forma clara, útil y coherente.
+
+=== HISTORIAL RECIENTE ===
+{historial_texto}
+=== FIN DEL HISTORIAL ===
+
+Usuario: {mensaje}
+
+Asistente:"""
+        
+        if self.proveedor == "gemini":
+            return self._enviar_gemini(mensaje_completo)
+        elif self.proveedor == "openai":
+            return self._enviar_openai(mensaje_completo)
+        elif self.proveedor == "groq":
+            return self._enviar_groq(mensaje_completo)
+        elif self.proveedor == "claude":
+            return self._enviar_claude(mensaje_completo)
+        elif self.proveedor == "deepseek":
+            return self._enviar_deepseek(mensaje_completo)
+        
+        return "Proveedor no soportado"
+    
+    def enviar_mensaje(self, mensaje):
+        return self.enviar_mensaje_con_historial(mensaje, [], "Neutral", "General")
+    
+    def generar_codigo_con_ia(self, descripcion, lenguaje):
+        if not self.api_key:
+            return None
+        
+        prompt = f"""Genera código en {lenguaje} para la siguiente descripción:
+{descripcion}
+
+REGLAS:
+1. El código debe ser funcional y ejecutable
+2. Incluye comentarios explicativos
+3. Responde SOLO con el código, sin explicaciones adicionales
+4. Usa las mejores prácticas de {lenguaje}
+
+Código generado:"""
+        
+        if self.proveedor == "gemini":
+            return self._enviar_gemini_conversion(prompt)
+        elif self.proveedor == "openai":
+            return self._enviar_openai_conversion(prompt)
+        elif self.proveedor == "groq":
+            return self._enviar_groq_conversion(prompt)
+        elif self.proveedor == "claude":
+            return self._enviar_claude_conversion(prompt)
+        elif self.proveedor == "deepseek":
+            return self._enviar_deepseek_conversion(prompt)
+        
+        return None
+    
+    def convertir_codigo_con_ia(self, codigo_original, lenguaje_origen, lenguaje_destino):
+        if not self.api_key:
+            return None
+        
+        prompt = f"""Convierte el siguiente código de {lenguaje_origen} a {lenguaje_destino}.
+
+REGLAS:
+1. El código convertido DEBE ser funcional
+2. Adapta todas las funciones manteniendo la misma lógica
+3. Usa la sintaxis correcta de {lenguaje_destino}
+4. NO incluyas explicaciones, SOLO el código
+
+Código original ({lenguaje_origen}):
+{codigo_original}
+
+Código convertido a {lenguaje_destino}:"""
+        
+        if self.proveedor == "gemini":
+            return self._enviar_gemini_conversion(prompt)
+        elif self.proveedor == "openai":
+            return self._enviar_openai_conversion(prompt)
+        elif self.proveedor == "groq":
+            return self._enviar_groq_conversion(prompt)
+        elif self.proveedor == "claude":
+            return self._enviar_claude_conversion(prompt)
+        elif self.proveedor == "deepseek":
+            return self._enviar_deepseek_conversion(prompt)
+        
+        return None
+    
+    def corregir_codigo_con_ia(self, codigo, lenguaje, error_msg, intento):
+        if not self.api_key:
+            return None
+        
+        prompt = f"""El siguiente código en {lenguaje} falló al ejecutarse con el error:
+
+{error_msg}
+
+Código original:
+{codigo}
+
+Corrige el código para que sea funcional y ejecutable. Devuelve SOLO el código corregido, sin explicaciones.
+Intento de corrección #{intento}."""
+        
+        if self.proveedor == "gemini":
+            return self._enviar_gemini_conversion(prompt)
+        elif self.proveedor == "openai":
+            return self._enviar_openai_conversion(prompt)
+        elif self.proveedor == "groq":
+            return self._enviar_groq_conversion(prompt)
+        elif self.proveedor == "claude":
+            return self._enviar_claude_conversion(prompt)
+        elif self.proveedor == "deepseek":
+            return self._enviar_deepseek_conversion(prompt)
+        return None
+    
+    def _extraer_codigo_de_respuesta(self, respuesta):
+        patron = r'```(?:\w+)?\n([\s\S]*?)```'
+        matches = re.findall(patron, respuesta)
+        if matches:
+            return matches[0].strip()
+        return respuesta.strip()
+    
+    def _enviar_gemini_conversion(self, mensaje):
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=self.api_key)
+            model = genai.GenerativeModel(self.modelo)
+            response = model.generate_content(mensaje)
+            return self._extraer_codigo_de_respuesta(response.text)
+        except Exception as e:
+            return None
+    
+    def _enviar_openai_conversion(self, mensaje):
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=self.api_key)
+            response = client.chat.completions.create(
+                model=self.modelo,
+                messages=[{"role": "user", "content": mensaje}]
+            )
+            return self._extraer_codigo_de_respuesta(response.choices[0].message.content)
+        except Exception as e:
+            return None
+    
+    def _enviar_groq_conversion(self, mensaje):
+        try:
+            from groq import Groq
+            client = Groq(api_key=self.api_key)
+            response = client.chat.completions.create(
+                model=self.modelo,
+                messages=[{"role": "user", "content": mensaje}]
+            )
+            return self._extraer_codigo_de_respuesta(response.choices[0].message.content)
+        except Exception as e:
+            return None
+    
+    def _enviar_claude_conversion(self, mensaje):
+        try:
+            import anthropic
+            client = anthropic.Anthropic(api_key=self.api_key)
+            response = client.messages.create(
+                model=self.modelo,
+                max_tokens=4096,
+                messages=[{"role": "user", "content": mensaje}]
+            )
+            return self._extraer_codigo_de_respuesta(response.content[0].text)
+        except Exception as e:
+            return None
+    
+    def _enviar_deepseek_conversion(self, mensaje):
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com/v1")
+            response = client.chat.completions.create(
+                model=self.modelo,
+                messages=[{"role": "user", "content": mensaje}]
+            )
+            return self._extraer_codigo_de_respuesta(response.choices[0].message.content)
+        except Exception as e:
+            return None
+    
+    def _enviar_gemini(self, mensaje):
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=self.api_key)
+            model = genai.GenerativeModel(self.modelo)
+            response = model.generate_content(mensaje)
+            return response.text
+        except Exception as e:
+            return f"Error Gemini: {str(e)}"
+    
+    def _enviar_openai(self, mensaje):
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=self.api_key)
+            response = client.chat.completions.create(
+                model=self.modelo,
+                messages=[{"role": "user", "content": mensaje}]
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            return f"Error OpenAI: {str(e)}"
+    
+    def _enviar_groq(self, mensaje):
+        try:
+            from groq import Groq
+            client = Groq(api_key=self.api_key)
+            response = client.chat.completions.create(
+                model=self.modelo,
+                messages=[{"role": "user", "content": mensaje}]
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            return f"Error Groq: {str(e)}"
+    
+    def _enviar_claude(self, mensaje):
+        try:
+            import anthropic
+            client = anthropic.Anthropic(api_key=self.api_key)
+            response = client.messages.create(
+                model=self.modelo,
+                max_tokens=4096,
+                messages=[{"role": "user", "content": mensaje}]
+            )
+            return response.content[0].text
+        except Exception as e:
+            return f"Error Claude: {str(e)}"
+    
+    def _enviar_deepseek(self, mensaje):
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=self.api_key, base_url="https://api.deepseek.com/v1")
+            response = client.chat.completions.create(
+                model=self.modelo,
+                messages=[{"role": "user", "content": mensaje}]
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            return f"Error DeepSeek: {str(e)}"
+
+# ==================================================
+# PANEL DE TERMINAL
+# ==================================================
+
+class TerminalPanel:
+    def __init__(self, parent, proyecto_ruta=None, lenguaje=None):
+        self.parent = parent
+        self.proyecto_ruta = proyecto_ruta
+        self.lenguaje = lenguaje
+        self.proceso = None
+        
+        self.frame = tk.Frame(parent, bg="#0d1117")
+        self.frame.pack(fill=tk.BOTH, expand=True)
+        
+        header = tk.Frame(self.frame, bg="#2d2d3d", height=35)
+        header.pack(fill=tk.X, padx=5, pady=5)
+        header.pack_propagate(False)
+        
+        tk.Label(header, text="💻 TERMINAL", font=("Segoe UI", 10, "bold"),
+                bg="#2d2d3d", fg="#50fa7b").pack(side=tk.LEFT, padx=10)
+        
+        ruta_texto = proyecto_ruta if proyecto_ruta else "Sin proyecto"
+        tk.Label(header, text=f"📁 {os.path.basename(ruta_texto) if proyecto_ruta else 'Sin proyecto'}",
+                bg="#2d2d3d", fg="#8b949e", font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=10)
+        
+        btn_frame = tk.Frame(header, bg="#2d2d3d")
+        btn_frame.pack(side=tk.RIGHT, padx=10)
+        
+        if lenguaje:
+            config = LENGUAJES_CONFIG.get(lenguaje, {})
+            if config.get("comandos", {}).get("pip"):
+                tk.Button(btn_frame, text="pip install", command=lambda: self.insertar_comando("pip install "),
+                         bg="#21262d", fg="#c9d1d9", relief=tk.FLAT, padx=8).pack(side=tk.LEFT, padx=2)
+            if config.get("comandos", {}).get("npm"):
+                tk.Button(btn_frame, text="npm install", command=lambda: self.insertar_comando("npm install "),
+                         bg="#21262d", fg="#c9d1d9", relief=tk.FLAT, padx=8).pack(side=tk.LEFT, padx=2)
+            
+            tk.Button(btn_frame, text="🧹 Limpiar", command=self.limpiar,
+                     bg="#21262d", fg="#c9d1d9", relief=tk.FLAT, padx=8).pack(side=tk.LEFT, padx=2)
+        
+        self.output_area = scrolledtext.ScrolledText(
+            self.frame, wrap=tk.WORD, font=("Consolas", 10),
+            bg="#0d1117", fg="#e0e0e0", insertbackground="white",
+            relief=tk.FLAT, padx=10, pady=10
+        )
+        self.output_area.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        self.output_area.tag_config("comando", foreground="#ffb86c")
+        self.output_area.tag_config("error", foreground="#ff5555")
+        self.output_area.tag_config("exito", foreground="#50fa7b")
+        
+        input_frame = tk.Frame(self.frame, bg="#2d2d3d", height=35)
+        input_frame.pack(fill=tk.X, padx=5, pady=5)
+        input_frame.pack_propagate(False)
+        
+        tk.Label(input_frame, text="$>", font=("Consolas", 11, "bold"),
+                bg="#2d2d3d", fg="#50fa7b").pack(side=tk.LEFT, padx=5)
+        
+        self.comando_entry = tk.Entry(input_frame, font=("Consolas", 11),
+                                       bg="#1e1e2e", fg="#e0e0e0",
+                                       insertbackground="white", relief=tk.FLAT)
+        self.comando_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        self.comando_entry.bind("<Return>", self.ejecutar_comando)
+        
+        tk.Button(input_frame, text="▶ Ejecutar", command=self.ejecutar_comando,
+                 bg="#50fa7b", fg="#1e1e2e", font=("Segoe UI", 9, "bold"),
+                 relief=tk.FLAT, padx=10).pack(side=tk.RIGHT, padx=5)
+        
+        self.mostrar_bienvenida()
+    
+    def mostrar_bienvenida(self):
+        self.output_area.insert(tk.END, "=" * 50 + "\n", "exito")
+        self.output_area.insert(tk.END, "🐍 HYDRA CREATOR - TERMINAL\n", "exito")
+        self.output_area.insert(tk.END, "=" * 50 + "\n", "exito")
+        self.output_area.insert(tk.END, f"📁 Directorio: {self.proyecto_ruta if self.proyecto_ruta else 'Sistema'}\n", "info")
+        if self.lenguaje:
+            self.output_area.insert(tk.END, f"🔧 Lenguaje: {self.lenguaje.upper()}\n", "info")
+            self.output_area.insert(tk.END, f"📦 Comandos disponibles: pip, npm, {self.lenguaje}\n", "info")
+        self.output_area.insert(tk.END, "=" * 50 + "\n\n", "exito")
+        self.output_area.see(tk.END)
+    
+    def insertar_comando(self, comando):
+        self.comando_entry.delete(0, tk.END)
+        self.comando_entry.insert(0, comando)
+        self.comando_entry.focus_set()
+    
+    def ejecutar_comando(self, event=None):
+        comando = self.comando_entry.get().strip()
+        if not comando:
+            return
+        
+        self.comando_entry.delete(0, tk.END)
+        
+        self.output_area.insert(tk.END, f"\n$> {comando}\n", "comando")
+        self.output_area.see(tk.END)
+        
+        def ejecutar():
+            try:
+                cwd = self.proyecto_ruta if self.proyecto_ruta and os.path.exists(self.proyecto_ruta) else None
+                
+                proceso = subprocess.run(
+                    comando, shell=True, capture_output=True, text=True,
+                    timeout=60, cwd=cwd
+                )
+                
+                if proceso.stdout:
+                    self.parent.after(0, lambda: self.output_area.insert(tk.END, proceso.stdout, "resultado"))
+                if proceso.stderr:
+                    self.parent.after(0, lambda: self.output_area.insert(tk.END, proceso.stderr, "error"))
+                
+                if proceso.returncode == 0:
+                    self.parent.after(0, lambda: self.output_area.insert(tk.END, f"\n✅ Comando ejecutado exitosamente (código: {proceso.returncode})\n", "exito"))
+                else:
+                    self.parent.after(0, lambda: self.output_area.insert(tk.END, f"\n❌ Error (código: {proceso.returncode})\n", "error"))
+                
+                self.parent.after(0, lambda: self.output_area.insert(tk.END, "\n" + "─" * 40 + "\n", "linea"))
+                self.parent.after(0, lambda: self.output_area.see(tk.END))
+                
+            except subprocess.TimeoutExpired:
+                self.parent.after(0, lambda: self.output_area.insert(tk.END, "\n❌ Timeout - El comando tardó demasiado\n", "error"))
+            except Exception as e:
+                self.parent.after(0, lambda: self.output_area.insert(tk.END, f"\n❌ Error: {str(e)}\n", "error"))
+        
+        threading.Thread(target=ejecutar, daemon=True).start()
+    
+    def limpiar(self):
+        self.output_area.delete("1.0", tk.END)
+        self.mostrar_bienvenida()
+
+# ==================================================
+# PANEL DE PROYECTOS
+# ==================================================
+
+class ProyectoPanel:
+    def __init__(self, parent, on_select_proyecto, obtener_ia_reciente_callback):
+        self.parent = parent
+        self.on_select_proyecto = on_select_proyecto
+        self.obtener_ia_reciente = obtener_ia_reciente_callback
+        self.proyectos = cargar_proyectos()
+        self.widgets_proyectos = []
+        self.proyecto_actual = None
+        self.proyecto_frame_actual = None
+        
+        self.frame = tk.Frame(parent, bg="#1e1e2e")
+        self.frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.setup_ui()
+    
+    def setup_ui(self):
+        tk.Label(self.frame, text="📁 PROYECTOS", font=("Segoe UI", 12, "bold"),
+                bg="#1e1e2e", fg="#50fa7b").pack(pady=(10, 5))
+        
+        self.btn_nuevo = tk.Button(self.frame, text="➕ Nuevo Proyecto",
+                                    command=self.crear_nuevo_proyecto,
+                                    bg="#50fa7b", fg="#1e1e2e",
+                                    font=("Segoe UI", 10, "bold"),
+                                    relief=tk.FLAT, cursor="hand2")
+        self.btn_nuevo.pack(pady=5, padx=10, fill=tk.X)
+        
+        self.proyectos_frame = tk.Frame(self.frame, bg="#1e1e2e")
+        self.proyectos_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.canvas = tk.Canvas(self.proyectos_frame, bg="#1e1e2e", highlightthickness=0)
+        self.scrollbar = tk.Scrollbar(self.proyectos_frame, orient="vertical", command=self.canvas.yview)
+        self.scrollable_frame = tk.Frame(self.canvas, bg="#1e1e2e")
+        
+        self.scrollable_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw", width=230)
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        self.cargar_proyectos_lista()
+    
+    def cargar_proyectos_lista(self):
+        for widget in self.widgets_proyectos:
+            widget.destroy()
+        self.widgets_proyectos.clear()
+        
+        for proyecto_id, datos in self.proyectos.items():
+            widget = tk.Frame(self.scrollable_frame, bg="#2d2d3d", relief=tk.FLAT, bd=1)
+            widget.pack(fill=tk.X, pady=2, padx=5)
+            
+            lenguaje = datos.get("lenguaje", "python")
+            icono = LENGUAJES_CONFIG.get(lenguaje, {}).get("icono", "📄")
+            
+            lbl_nombre = tk.Label(widget, text=f"{icono} {datos['nombre']}", 
+                                   bg="#2d2d3d", fg="#e0e0e0",
+                                   font=("Segoe UI", 10), anchor=tk.W)
+            lbl_nombre.pack(side=tk.LEFT, padx=10, pady=8, fill=tk.X, expand=True)
+            
+            btn_menu = tk.Button(widget, text="⋮", bg="#2d2d3d", fg="#50fa7b",
+                                  relief=tk.FLAT, cursor="hand2", font=("Segoe UI", 10),
+                                  command=lambda pid=proyecto_id: self.mostrar_menu(pid))
+            btn_menu.pack(side=tk.RIGHT, padx=5)
+            
+            widget.bind("<Button-1>", lambda e, pid=proyecto_id: self.seleccionar_proyecto(pid))
+            lbl_nombre.bind("<Button-1>", lambda e, pid=proyecto_id: self.seleccionar_proyecto(pid))
+            
+            self.widgets_proyectos.append(widget)
+    
+    def mostrar_menu(self, proyecto_id):
+        menu = tk.Menu(self.parent, tearoff=0, bg="#2d2d3d", fg="#e0e0e0")
+        menu.add_command(label="✏️ Cambiar Nombre", command=lambda: self.cambiar_nombre(proyecto_id))
+        menu.add_separator()
+        menu.add_command(label="🗑 Eliminar Proyecto", command=lambda: self.eliminar_proyecto(proyecto_id))
+        menu.post(self.parent.winfo_pointerx(), self.parent.winfo_pointery())
+    
+    def cambiar_nombre(self, proyecto_id):
+        nuevo_nombre = simpledialog.askstring("Cambiar Nombre", "Nuevo nombre:")
+        if nuevo_nombre:
+            self.proyectos[proyecto_id]["nombre"] = nuevo_nombre
+            guardar_proyectos(self.proyectos)
+            self.cargar_proyectos_lista()
+            if self.proyecto_actual == proyecto_id:
+                self.on_select_proyecto(proyecto_id, self.proyectos[proyecto_id])
+    
+    def eliminar_proyecto(self, proyecto_id):
+        if messagebox.askyesno("Eliminar", f"¿Eliminar proyecto '{self.proyectos[proyecto_id]['nombre']}'?"):
+            ruta = self.proyectos[proyecto_id].get("ruta")
+            if ruta and os.path.exists(ruta):
+                shutil.rmtree(ruta, ignore_errors=True)
+            del self.proyectos[proyecto_id]
+            guardar_proyectos(self.proyectos)
+            
+            if self.proyecto_actual == proyecto_id:
+                self.proyecto_actual = None
+                if HydraCreator.instance and HydraCreator.instance.editor_actual:
+                    HydraCreator.instance.editor_actual.frame.destroy()
+                    HydraCreator.instance.editor_actual = None
+                if HydraCreator.instance and HydraCreator.instance.modo_actual == "proyectos":
+                    HydraCreator.instance.chat_frame.pack(fill=tk.BOTH, expand=True)
+            
+            self.cargar_proyectos_lista()
+    
+    def seleccionar_proyecto(self, proyecto_id):
+        self.proyecto_actual = proyecto_id
+        datos = self.proyectos.get(proyecto_id, {})
+        self.on_select_proyecto(proyecto_id, datos)
+    
+    def crear_nuevo_proyecto(self):
+        ventana = tk.Toplevel(self.parent)
+        ventana.title("Nuevo Proyecto")
+        ventana.geometry("500x600")
+        ventana.configure(bg="#1e1e2e")
+        ventana.transient(self.parent)
+        ventana.grab_set()
+        
+        frame = tk.Frame(ventana, bg="#1e1e2e")
+        frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        
+        tk.Label(frame, text="🚀 Crear Nuevo Proyecto", font=("Segoe UI", 16, "bold"),
+                bg="#1e1e2e", fg="#50fa7b").pack(pady=10)
+        
+        tk.Label(frame, text="Nombre del proyecto:", font=("Segoe UI", 11),
+                bg="#1e1e2e", fg="#e0e0e0").pack(anchor=tk.W, pady=5)
+        nombre_entry = tk.Entry(frame, font=("Segoe UI", 11), bg="#3d3d4d", fg="white", width=40)
+        nombre_entry.pack(fill=tk.X, pady=5)
+        
+        tk.Label(frame, text="Lenguaje de programación:", font=("Segoe UI", 11),
+                bg="#1e1e2e", fg="#e0e0e0").pack(anchor=tk.W, pady=5)
+        
+        lenguaje_var = tk.StringVar(value="python")
+        lenguajes_frame = tk.Frame(frame, bg="#1e1e2e")
+        lenguajes_frame.pack(fill=tk.X, pady=5)
+        
+        for i, (lang, config) in enumerate(LENGUAJES_CONFIG.items()):
+            rb = tk.Radiobutton(lenguajes_frame, text=f"{config['icono']} {lang.upper()}", 
+                                variable=lenguaje_var, value=lang,
+                                bg="#1e1e2e", fg="#e0e0e0", selectcolor="#2d2d3d")
+            rb.grid(row=i//3, column=i%3, sticky=tk.W, padx=10, pady=5)
+        
+        tk.Label(frame, text="Descripción (opcional):", font=("Segoe UI", 11),
+                bg="#1e1e2e", fg="#e0e0e0").pack(anchor=tk.W, pady=5)
+        desc_text = tk.Text(frame, height=4, font=("Segoe UI", 10),
+                            bg="#3d3d4d", fg="white", wrap=tk.WORD)
+        desc_text.pack(fill=tk.X, pady=5)
+        
+        def crear():
+            nombre = nombre_entry.get().strip()
+            if not nombre:
+                messagebox.showerror("Error", "Ingresa un nombre")
+                return
+            
+            lenguaje = lenguaje_var.get()
+            descripcion = desc_text.get("1.0", tk.END).strip()
+            
+            desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+            proyecto_folder = os.path.join(desktop, f"HydraCreator_{nombre.replace(' ', '_')}")
+            os.makedirs(proyecto_folder, exist_ok=True)
+            
+            extension = LENGUAJES_CONFIG[lenguaje]["extension"]
+            archivo_principal = os.path.join(proyecto_folder, f"main{extension}")
+            
+            template = self._obtener_template(lenguaje, nombre)
+            with open(archivo_principal, "w", encoding="utf-8") as f:
+                f.write(template)
+            
+            proyecto_id = str(int(datetime.now().timestamp()))
+            self.proyectos[proyecto_id] = {
+                "nombre": nombre,
+                "lenguaje": lenguaje,
+                "ruta": proyecto_folder,
+                "archivo_principal": archivo_principal,
+                "descripcion": descripcion,
+                "creado": datetime.now().isoformat()
+            }
+            guardar_proyectos(self.proyectos)
+            self.cargar_proyectos_lista()
+            ventana.destroy()
+            self.seleccionar_proyecto(proyecto_id)
+            messagebox.showinfo("Éxito", f"Proyecto creado en:\n{proyecto_folder}")
+        
+        tk.Button(frame, text="Crear Proyecto", command=crear,
+                 bg="#50fa7b", fg="#1e1e2e", font=("Segoe UI", 11, "bold"),
+                 padx=20, pady=8, relief=tk.FLAT, cursor="hand2").pack(pady=20)
+    
+    def _obtener_template(self, lenguaje, nombre):
+        templates = {
+            "python": f'# {nombre}\n# Creado con Hydra Creator\n\nprint("¡Hola desde {nombre}!")',
+            "javascript": f'// {nombre}\n// Creado con Hydra Creator\n\nconsole.log("¡Hola desde {nombre}!");',
+            "html": f'<!DOCTYPE html>\n<html>\n<head>\n    <title>{nombre}</title>\n</head>\n<body>\n    <h1>¡Hola desde {nombre}!</h1>\n</body>\n</html>',
+            "cpp": f'// {nombre}\n// Creado con Hydra Creator\n\n#include <iostream>\nusing namespace std;\n\nint main() {{\n    cout << "¡Hola desde {nombre}!" << endl;\n    return 0;\n}}',
+            "java": f'// {nombre}\n// Creado con Hydra Creator\n\npublic class Main {{\n    public static void main(String[] args) {{\n        System.out.println("¡Hola desde {nombre}!");\n    }}\n}}',
+            "csharp": f'// {nombre}\n// Creado con Hydra Creator\n\nusing System;\n\nclass Program {{\n    static void Main() {{\n        Console.WriteLine("¡Hola desde {nombre}!");\n    }}\n}}',
+            "go": f'// {nombre}\n// Creado con Hydra Creator\n\npackage main\n\nimport "fmt"\n\nfunc main() {{\n    fmt.Println("¡Hola desde {nombre}!")\n}}',
+            "rust": f'// {nombre}\n// Creado con Hydra Creator\n\nfn main() {{\n    println!("¡Hola desde {nombre}!");\n}}'
+        }
+        return templates.get(lenguaje, f'# {nombre}\nprint("¡Hola desde {nombre}!")')
+
+# ==================================================
+# EDITOR DE PROYECTO
+# ==================================================
+
+class EditorProyecto:
+    def __init__(self, parent, proyecto_id, datos, obtener_ia_reciente_callback):
+        self.parent = parent
+        self.proyecto_id = proyecto_id
+        self.datos = datos
+        self.obtener_ia_reciente = obtener_ia_reciente_callback
+        self.archivo_actual = datos.get("archivo_principal")
+        self.lenguaje = datos.get("lenguaje", "python")
+        self.ruta_proyecto = datos.get("ruta")
+        self.terminal_panel = None
+        self.modo_actual = "editor"
+        
+        self.frame = tk.Frame(parent, bg="#2d2d3d")
+        self.frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.setup_ui()
+        self.cargar_archivo()
+    
+    def setup_ui(self):
+        header = tk.Frame(self.frame, bg="#2d2d3d", height=50)
+        header.pack(fill=tk.X, padx=10, pady=10)
+        header.pack_propagate(False)
+        
+        icono = LENGUAJES_CONFIG.get(self.lenguaje, {}).get("icono", "📄")
+        tk.Label(header, text=f"{icono} {self.datos['nombre']}", font=("Segoe UI", 14, "bold"),
+                bg="#2d2d3d", fg="#ffb86c").pack(side=tk.LEFT, padx=10)
+        
+        tk.Label(header, text=f"Lenguaje: {self.lenguaje.upper()}", font=("Segoe UI", 10),
+                bg="#2d2d3d", fg="#8b949e").pack(side=tk.LEFT, padx=10)
+        
+        modo_frame = tk.Frame(header, bg="#2d2d3d")
+        modo_frame.pack(side=tk.LEFT, padx=20)
+        
+        self.btn_editor = tk.Button(modo_frame, text="📝 Editor", command=self.mostrar_editor,
+                                     bg="#50fa7b", fg="#1e1e2e", font=("Segoe UI", 9, "bold"),
+                                     relief=tk.FLAT, padx=10)
+        self.btn_editor.pack(side=tk.LEFT, padx=2)
+        
+        self.btn_terminal = tk.Button(modo_frame, text="💻 Terminal", command=self.mostrar_terminal,
+                                       bg="#2d2d3d", fg="#e0e0e0", font=("Segoe UI", 9, "bold"),
+                                       relief=tk.FLAT, padx=10)
+        self.btn_terminal.pack(side=tk.LEFT, padx=2)
+        
+        btn_frame = tk.Frame(header, bg="#2d2d3d")
+        btn_frame.pack(side=tk.RIGHT, padx=10)
+        
+        tk.Button(btn_frame, text="💾 Guardar", command=self.guardar_archivo,
+                 bg="#50fa7b", fg="#1e1e2e", font=("Segoe UI", 10, "bold"),
+                 padx=15, pady=5, relief=tk.FLAT, cursor="hand2").pack(side=tk.LEFT, padx=5)
+        
+        tk.Button(btn_frame, text="▶ Ejecutar", command=self.ejecutar_codigo,
+                 bg="#ffb86c", fg="#1e1e2e", font=("Segoe UI", 10, "bold"),
+                 padx=15, pady=5, relief=tk.FLAT, cursor="hand2").pack(side=tk.LEFT, padx=5)
+        
+        tk.Button(btn_frame, text="🔧 Compilar", command=self.compilar_codigo,
+                 bg="#6272a4", fg="white", font=("Segoe UI", 10, "bold"),
+                 padx=15, pady=5, relief=tk.FLAT, cursor="hand2").pack(side=tk.LEFT, padx=5)
+        
+        if LENGUAJES_CONFIG.get(self.lenguaje, {}).get("comandos", {}).get("exe"):
+            tk.Button(btn_frame, text="📦 EXE", command=self.crear_exe,
+                     bg="#8be9fd", fg="#1e1e2e", font=("Segoe UI", 10, "bold"),
+                     padx=12, pady=5, relief=tk.FLAT, cursor="hand2").pack(side=tk.LEFT, padx=5)
+        
+        tk.Button(btn_frame, text="🤖 IA", command=self.abrir_chat_ia,
+                 bg="#bd93f9", fg="#1e1e2e", font=("Segoe UI", 10, "bold"),
+                 padx=12, pady=5, relief=tk.FLAT, cursor="hand2").pack(side=tk.LEFT, padx=5)
+        
+        self.contenido_frame = tk.Frame(self.frame, bg="#1e1e2e")
+        self.contenido_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        self.editor_frame = tk.Frame(self.contenido_frame, bg="#1e1e2e")
+        
+        tk.Label(self.editor_frame, text="📝 CÓDIGO", font=("Segoe UI", 10, "bold"),
+                bg="#1e1e2e", fg="#50fa7b").pack(anchor=tk.W)
+        
+        self.code_editor = scrolledtext.ScrolledText(
+            self.editor_frame, wrap=tk.NONE, font=("Consolas", 11),
+            bg="#1e1e2e", fg="#e0e0e0", insertbackground="white",
+            relief=tk.FLAT, padx=10, pady=10
+        )
+        self.code_editor.pack(fill=tk.BOTH, expand=True)
+        
+        output_frame = tk.Frame(self.editor_frame, bg="#1e1e2e")
+        output_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        
+        tk.Label(output_frame, text="📤 SALIDA", font=("Segoe UI", 10, "bold"),
+                bg="#1e1e2e", fg="#ffb86c").pack(anchor=tk.W)
+        
+        self.output_area = scrolledtext.ScrolledText(
+            output_frame, wrap=tk.WORD, font=("Consolas", 10),
+            bg="#0d1117", fg="#e0e0e0", insertbackground="white",
+            relief=tk.FLAT, padx=10, pady=10, height=8
+        )
+        self.output_area.pack(fill=tk.BOTH, expand=True)
+        
+        self.output_area.tag_config("titulo", foreground="#50fa7b")
+        self.output_area.tag_config("error", foreground="#ff5555")
+        self.output_area.tag_config("resultado", foreground="#f1fa8c")
+        self.output_area.tag_config("linea", foreground="#6272a4")
+        
+        self.mostrar_editor()
+    
+    def mostrar_editor(self):
+        self.modo_actual = "editor"
+        self.btn_editor.config(bg="#50fa7b", fg="#1e1e2e")
+        self.btn_terminal.config(bg="#2d2d3d", fg="#e0e0e0")
+        
+        if self.terminal_panel:
+            self.terminal_panel.frame.pack_forget()
+        
+        self.editor_frame.pack(fill=tk.BOTH, expand=True)
+    
+    def mostrar_terminal(self):
+        self.modo_actual = "terminal"
+        self.btn_terminal.config(bg="#50fa7b", fg="#1e1e2e")
+        self.btn_editor.config(bg="#2d2d3d", fg="#e0e0e0")
+        
+        self.editor_frame.pack_forget()
+        
+        if not self.terminal_panel:
+            self.terminal_panel = TerminalPanel(self.contenido_frame, self.ruta_proyecto, self.lenguaje)
+        else:
+            self.terminal_panel.frame.pack(fill=tk.BOTH, expand=True)
+    
+    def cargar_archivo(self):
+        try:
+            with open(self.archivo_actual, "r", encoding="utf-8") as f:
+                contenido = f.read()
+            self.code_editor.delete("1.0", tk.END)
+            self.code_editor.insert("1.0", contenido)
+        except Exception as e:
+            self.output_area.insert(tk.END, f"❌ Error al cargar: {str(e)}\n", "error")
+    
+    def guardar_archivo(self):
+        try:
+            contenido = self.code_editor.get("1.0", tk.END).strip()
+            with open(self.archivo_actual, "w", encoding="utf-8") as f:
+                f.write(contenido)
+            self.output_area.insert(tk.END, "✅ Archivo guardado\n", "resultado")
+            self.output_area.see(tk.END)
+        except Exception as e:
+            self.output_area.insert(tk.END, f"❌ Error al guardar: {str(e)}\n", "error")
+    
+    def ejecutar_codigo(self):
+        self.guardar_archivo()
+        
+        comando = LENGUAJES_CONFIG.get(self.lenguaje, {}).get("comandos", {}).get("ejecutar")
+        if not comando:
+            self.output_area.insert(tk.END, f"⚠️ No hay comando de ejecución para {self.lenguaje}\n", "error")
+            return
+        
+        archivo = self.archivo_actual
+        archivo_sin_ext = os.path.splitext(archivo)[0]
+        nombre_clase = os.path.basename(archivo_sin_ext)
+        
+        comando = comando.format(archivo=archivo, archivo_sin_ext=archivo_sin_ext, nombre_clase=nombre_clase)
+        
+        self.output_area.delete("1.0", tk.END)
+        self.output_area.insert(tk.END, f"🔄 Ejecutando: {comando}\n\n", "titulo")
+        self.output_area.see(tk.END)
+        
+        def ejecutar():
+            try:
+                if self.lenguaje == "html":
+                    import webbrowser
+                    webbrowser.open(f'file://{archivo}')
+                    resultado = "HTML abierto en el navegador"
+                else:
+                    proceso = subprocess.run(comando, shell=True, capture_output=True, text=True, timeout=30, cwd=os.path.dirname(archivo))
+                    resultado = proceso.stdout if proceso.stdout else "(sin salida)"
+                    if proceso.stderr:
+                        resultado += f"\n⚠️ {proceso.stderr}"
+                
+                self.parent.after(0, lambda: self._mostrar_resultado(resultado, proceso.returncode if 'proceso' in dir() else 0))
+            except subprocess.TimeoutExpired:
+                self.parent.after(0, lambda: self._mostrar_error("Timeout - El código tardó demasiado"))
+            except Exception as e:
+                self.parent.after(0, lambda: self._mostrar_error(str(e)))
+        
+        threading.Thread(target=ejecutar, daemon=True).start()
+    
+    def compilar_codigo(self):
+        comando = LENGUAJES_CONFIG.get(self.lenguaje, {}).get("comandos", {}).get("compilar")
+        if not comando:
+            self.output_area.insert(tk.END, f"⚠️ No hay comando de compilación para {self.lenguaje}\n", "error")
+            return
+        
+        archivo = self.archivo_actual
+        archivo_sin_ext = os.path.splitext(archivo)[0]
+        
+        comando = comando.format(archivo=archivo, archivo_sin_ext=archivo_sin_ext)
+        
+        self.output_area.delete("1.0", tk.END)
+        self.output_area.insert(tk.END, f"🔨 Compilando: {comando}\n\n", "titulo")
+        self.output_area.see(tk.END)
+        
+        def compilar():
+            try:
+                proceso = subprocess.run(comando, shell=True, capture_output=True, text=True, timeout=60, cwd=os.path.dirname(archivo))
+                if proceso.returncode == 0:
+                    resultado = "✅ Compilación exitosa!\n" + (proceso.stdout if proceso.stdout else "")
+                else:
+                    resultado = f"❌ Error de compilación:\n{proceso.stderr}"
+                
+                self.parent.after(0, lambda: self._mostrar_resultado(resultado, proceso.returncode))
+            except Exception as e:
+                self.parent.after(0, lambda: self._mostrar_error(str(e)))
+        
+        threading.Thread(target=compilar, daemon=True).start()
+    
+    def crear_exe(self):
+        comando_base = LENGUAJES_CONFIG.get(self.lenguaje, {}).get("comandos", {}).get("exe")
+        if not comando_base:
+            self.output_area.insert(tk.END, f"⚠️ No hay comando para crear EXE en {self.lenguaje}\n", "error")
+            return
+
+        archivo = self.archivo_actual
+        if self.lenguaje != "python":
+            self.output_area.insert(tk.END, f"⚠️ Solo se puede generar EXE para proyectos Python.\n", "error")
+            return
+
+        # Verificar PyInstaller
+        try:
+            subprocess.run([sys.executable, "-m", "PyInstaller", "--version"], capture_output=True, check=True)
+        except subprocess.CalledProcessError:
+            self.output_area.insert(tk.END, "❌ PyInstaller no está instalado. Ejecuta: pip install pyinstaller\n", "error")
+            return
+        except FileNotFoundError:
+            self.output_area.insert(tk.END, "❌ No se pudo ejecutar Python.\n", "error")
+            return
+
+        # Pedir ubicación del ejecutable final
+        default_filename = f"{self.datos['nombre']}.exe"
+        exe_path = filedialog.asksaveasfilename(
+            defaultextension=".exe",
+            initialfile=default_filename,
+            filetypes=[("Archivos ejecutables", "*.exe"), ("Todos los archivos", "*.*")],
+            title="Guardar ejecutable como"
+        )
+        if not exe_path:
+            return
+
+        # Opciones adicionales: ícono
+        icon_path = None
+        if messagebox.askyesno("Ícono", "¿Quieres asignar un ícono personalizado (.ico)?"):
+            icon_path = filedialog.askopenfilename(
+                title="Seleccionar archivo .ico",
+                filetypes=[("Archivos de ícono", "*.ico"), ("Todos los archivos", "*.*")]
+            )
+            if icon_path:
+                self.output_area.insert(tk.END, f"Ícono seleccionado: {icon_path}\n", "info")
+
+        # Opciones adicionales: archivos extra
+        add_data = []
+        if messagebox.askyesno("Archivos adicionales", "¿Incluir archivos adicionales en el EXE (imágenes, config, etc.)?"):
+            files = filedialog.askopenfilenames(title="Seleccionar archivos adicionales")
+            for f in files:
+                add_data.append(f'"{f};."')
+            if add_data:
+                self.output_area.insert(tk.END, f"Archivos adicionales: {len(add_data)}\n", "info")
+
+        dest_dir = os.path.dirname(exe_path)
+        exe_name = os.path.basename(exe_path)
+        if exe_name.lower().endswith(".exe"):
+            exe_name = exe_name[:-4]
+
+        temp_build = os.path.join(os.path.dirname(archivo), "temp_build")
+        os.makedirs(temp_build, exist_ok=True)
+
+        # Construir comando PyInstaller
+        comando = [
+            sys.executable, "-m", "PyInstaller",
+            "--onefile",
+            "--windowed",
+            "--clean",
+            "--noconfirm",
+            f"--name={exe_name}",
+            f"--distpath={dest_dir}",
+            f"--workpath={temp_build}",
+            f"--specpath={temp_build}",
+        ]
+
+        if icon_path:
+            comando.append(f"--icon={icon_path}")
+        for data in add_data:
+            comando.append(f"--add-data={data}")
+
+        comando.append(archivo)
+
+        self.output_area.delete("1.0", tk.END)
+        self.output_area.insert(tk.END, f"📦 Creando ejecutable en:\n{exe_path}\n\n", "titulo")
+        self.output_area.insert(tk.END, f"Comando:\n{' '.join(comando)}\n\n", "resultado")
+        self.output_area.see(tk.END)
+
+        def crear():
+            try:
+                proceso = subprocess.run(comando, capture_output=True, text=True, timeout=300, cwd=os.path.dirname(archivo))
+                if proceso.stdout:
+                    self.parent.after(0, lambda: self.output_area.insert(tk.END, f"STDOUT:\n{proceso.stdout}\n", "resultado"))
+                if proceso.stderr:
+                    self.parent.after(0, lambda: self.output_area.insert(tk.END, f"STDERR:\n{proceso.stderr}\n", "error"))
+                
+                if os.path.exists(temp_build):
+                    shutil.rmtree(temp_build, ignore_errors=True)
+                
+                if proceso.returncode == 0:
+                    resultado = f"✅ Ejecutable creado exitosamente en:\n{exe_path}\n"
+                    self.parent.after(0, lambda: self._mostrar_resultado(resultado, 0))
+                else:
+                    error_msg = f"❌ Error al crear ejecutable (código {proceso.returncode}). Revisa los mensajes arriba."
+                    self.parent.after(0, lambda: self._mostrar_error(error_msg))
+            except subprocess.TimeoutExpired:
+                self.parent.after(0, lambda: self._mostrar_error("Timeout - La creación del EXE tardó demasiado"))
+            except Exception as e:
+                self.parent.after(0, lambda: self._mostrar_error(str(e)))
+
+        threading.Thread(target=crear, daemon=True).start()
+    
+    def abrir_chat_ia(self):
+        ia_client, chat_nombre = self.obtener_ia_reciente()
+        
+        if not ia_client:
+            messagebox.showerror("Error", "No hay chats configurados. Crea un chat primero en la sección CHATS.")
+            return
+        
+        ventana = tk.Toplevel(self.parent)
+        ventana.title(f"🤖 Asistente IA - {chat_nombre}")
+        ventana.geometry("700x600")
+        ventana.configure(bg="#1e1e2e")
+        ventana.transient(self.parent)
+        ventana.grab_set()
+        
+        frame = tk.Frame(ventana, bg="#1e1e2e")
+        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        header_frame = tk.Frame(frame, bg="#2d2d3d", height=40)
+        header_frame.pack(fill=tk.X, pady=(0, 10))
+        header_frame.pack_propagate(False)
+        
+        tk.Label(header_frame, text=f"🤖 Usando IA de: {chat_nombre}", font=("Segoe UI", 10, "bold"),
+                bg="#2d2d3d", fg="#50fa7b").pack(side=tk.LEFT, padx=10)
+        
+        tk.Label(header_frame, text=f"🎯 Generando código en: {self.lenguaje.upper()}", font=("Segoe UI", 10),
+                bg="#2d2d3d", fg="#ffb86c").pack(side=tk.RIGHT, padx=10)
+        
+        tk.Label(frame, text="📝 Describe el código que quieres generar:", font=("Segoe UI", 11, "bold"),
+                bg="#1e1e2e", fg="#e0e0e0").pack(anchor=tk.W, pady=5)
+        
+        desc_text = tk.Text(frame, height=6, font=("Segoe UI", 11),
+                            bg="#3d3d4d", fg="white", wrap=tk.WORD)
+        desc_text.pack(fill=tk.X, pady=5)
+        
+        ejemplos_frame = tk.Frame(frame, bg="#1e1e2e")
+        ejemplos_frame.pack(fill=tk.X, pady=5)
+        
+        tk.Label(ejemplos_frame, text="Ejemplos rápidos:", font=("Segoe UI", 9),
+                bg="#1e1e2e", fg="#8b949e").pack(anchor=tk.W)
+        
+        ejemplos = [
+            ("📊 Calculadora", "Crea una calculadora básica con suma, resta, multiplicación y división"),
+            ("📝 Lista de tareas", "Crea una aplicación de lista de tareas (To-Do List)"),
+            ("🌐 Cliente HTTP", "Crea una función que haga peticiones HTTP GET"),
+            ("📁 Leer archivo", "Crea una función para leer y escribir archivos"),
+            ("🔄 API REST", "Crea un cliente básico para consumir una API REST"),
+            ("🎮 Juego simple", "Crea un juego simple como adivinar el número")
+        ]
+        
+        for texto, desc in ejemplos:
+            btn = tk.Button(ejemplos_frame, text=texto, command=lambda d=desc: desc_text.insert(tk.END, d + "\n"),
+                           bg="#2d2d3d", fg="#8be9fd", font=("Segoe UI", 9),
+                           relief=tk.FLAT, cursor="hand2")
+            btn.pack(side=tk.LEFT, padx=2, pady=2)
+        
+        output_frame = tk.Frame(frame, bg="#1e1e2e")
+        output_frame.pack(fill=tk.BOTH, expand=True, pady=10)
+        
+        tk.Label(output_frame, text="🔧 Código generado:", font=("Segoe UI", 11, "bold"),
+                bg="#1e1e2e", fg="#ffb86c").pack(anchor=tk.W)
+        
+        output_area = scrolledtext.ScrolledText(output_frame, wrap=tk.WORD, font=("Consolas", 10),
+                                                 bg="#0d1117", fg="#e0e0e0", height=12)
+        output_area.pack(fill=tk.BOTH, expand=True)
+        
+        output_area.tag_config("titulo", foreground="#50fa7b")
+        output_area.tag_config("error", foreground="#ff5555")
+        output_area.tag_config("resultado", foreground="#f1fa8c")
+        output_area.tag_config("ejecutando", foreground="#ffb86c")
+        
+        def generar():
+            desc = desc_text.get("1.0", tk.END).strip()
+            if not desc:
+                messagebox.showerror("Error", "Ingresa una descripción")
+                return
+            
+            output_area.delete("1.0", tk.END)
+            output_area.insert(tk.END, "🔄 Generando código con IA...\n", "ejecutando")
+            output_area.insert(tk.END, f"📡 Usando: {chat_nombre}\n", "info")
+            output_area.see(tk.END)
+            
+            def generar_thread():
+                if ia_client:
+                    codigo = ia_client.generar_codigo_con_ia(desc, self.lenguaje)
+                    if codigo:
+                        ventana.after(0, lambda: output_area.delete("1.0", tk.END))
+                        ventana.after(0, lambda: output_area.insert(tk.END, "✅ Código generado:\n", "titulo"))
+                        ventana.after(0, lambda: output_area.insert(tk.END, "─" * 40 + "\n", "linea"))
+                        ventana.after(0, lambda: output_area.insert(tk.END, codigo, "resultado"))
+                    else:
+                        ventana.after(0, lambda: output_area.insert(tk.END, "❌ Error al generar código. Verifica tu API Key.\n", "error"))
+                else:
+                    ventana.after(0, lambda: output_area.insert(tk.END, "❌ No hay IA disponible. Configura un chat primero.\n", "error"))
+            
+            threading.Thread(target=generar_thread, daemon=True).start()
+        
+        def generar_y_insertar():
+            desc = desc_text.get("1.0", tk.END).strip()
+            if not desc:
+                messagebox.showerror("Error", "Ingresa una descripción")
+                return
+            
+            output_area.delete("1.0", tk.END)
+            output_area.insert(tk.END, "🔄 Generando código con IA...\n", "ejecutando")
+            output_area.insert(tk.END, f"📡 Usando: {chat_nombre}\n", "info")
+            output_area.see(tk.END)
+            
+            def generar_thread():
+                if ia_client:
+                    codigo = ia_client.generar_codigo_con_ia(desc, self.lenguaje)
+                    if codigo:
+                        ventana.after(0, lambda: output_area.delete("1.0", tk.END))
+                        ventana.after(0, lambda: output_area.insert(tk.END, "✅ Código generado e insertado en el editor!\n", "titulo"))
+                        ventana.after(0, lambda: output_area.insert(tk.END, "─" * 40 + "\n", "linea"))
+                        ventana.after(0, lambda: output_area.insert(tk.END, codigo, "resultado"))
+                        ventana.after(0, lambda: self.code_editor.insert(tk.END, "\n\n" + codigo))
+                    else:
+                        ventana.after(0, lambda: output_area.insert(tk.END, "❌ Error al generar código. Verifica tu API Key.\n", "error"))
+                else:
+                    ventana.after(0, lambda: output_area.insert(tk.END, "❌ No hay IA disponible. Configura un chat primero.\n", "error"))
+            
+            threading.Thread(target=generar_thread, daemon=True).start()
+        
+        btn_frame = tk.Frame(frame, bg="#1e1e2e")
+        btn_frame.pack(fill=tk.X, pady=10)
+        
+        tk.Button(btn_frame, text="🤖 Generar Código", command=generar,
+                 bg="#50fa7b", fg="#1e1e2e", font=("Segoe UI", 11, "bold"),
+                 padx=20, pady=8, relief=tk.FLAT, cursor="hand2").pack(side=tk.LEFT, padx=5)
+        
+        tk.Button(btn_frame, text="⚡ Generar y Insertar", command=generar_y_insertar,
+                 bg="#ffb86c", fg="#1e1e2e", font=("Segoe UI", 11, "bold"),
+                 padx=20, pady=8, relief=tk.FLAT, cursor="hand2").pack(side=tk.LEFT, padx=5)
+        
+        tk.Button(btn_frame, text="📋 Copiar", command=lambda: self._copiar_texto(output_area.get("1.0", tk.END).strip()),
+                 bg="#6272a4", fg="white", font=("Segoe UI", 10, "bold"),
+                 padx=15, pady=8, relief=tk.FLAT, cursor="hand2").pack(side=tk.LEFT, padx=5)
+        
+        tk.Button(btn_frame, text="💾 Insertar en Editor", 
+                 command=lambda: self.code_editor.insert(tk.END, "\n\n" + self._extraer_codigo(output_area.get("1.0", tk.END))),
+                 bg="#bd93f9", fg="#1e1e2e", font=("Segoe UI", 10, "bold"),
+                 padx=15, pady=8, relief=tk.FLAT, cursor="hand2").pack(side=tk.LEFT, padx=5)
+    
+    def _extraer_codigo(self, texto):
+        patron = r'```(?:\w+)?\n([\s\S]*?)```'
+        matches = re.findall(patron, texto)
+        if matches:
+            return matches[0].strip()
+        
+        lineas = texto.split('\n')
+        codigo = []
+        for linea in lineas:
+            if not linea.startswith('✅') and not linea.startswith('─') and not linea.startswith('🤖'):
+                codigo.append(linea)
+        return '\n'.join(codigo).strip()
+    
+    def _copiar_texto(self, texto):
+        try:
+            pyperclip.copy(texto)
+            self.output_area.insert(tk.END, "✅ Texto copiado al portapapeles\n", "resultado")
+            self.output_area.see(tk.END)
+        except:
+            self.parent.clipboard_clear()
+            self.parent.clipboard_append(texto)
+            self.output_area.insert(tk.END, "✅ Texto copiado al portapapeles\n", "resultado")
+    
+    def _mostrar_resultado(self, resultado, codigo=0):
+        self.output_area.delete("1.0", tk.END)
+        if codigo == 0:
+            self.output_area.insert(tk.END, "✅ EJECUCIÓN EXITOSA:\n", "titulo")
+            self.output_area.insert(tk.END, "─" * 40 + "\n", "linea")
+            self.output_area.insert(tk.END, resultado + "\n", "resultado")
+        else:
+            self.output_area.insert(tk.END, "❌ ERROR:\n", "error")
+            self.output_area.insert(tk.END, "─" * 40 + "\n", "linea")
+            self.output_area.insert(tk.END, resultado + "\n", "error")
+        self.output_area.see(tk.END)
+    
+    def _mostrar_error(self, error):
+        self.output_area.delete("1.0", tk.END)
+        self.output_area.insert(tk.END, f"❌ ERROR: {error}\n", "error")
+        self.output_area.see(tk.END)
+
+# ==================================================
+# PANEL DE CHAT
+# ==================================================
+
+class ChatWidget:
+    def __init__(self, parent, chat_id, nombre, on_select):
+        self.parent = parent
+        self.chat_id = chat_id
+        self.nombre = nombre
+        self.on_select = on_select
+        
+        self.frame = tk.Frame(parent, bg="#2d2d3d", relief=tk.FLAT, bd=1)
+        self.frame.pack(fill=tk.X, pady=2, padx=5)
+        
+        self.lbl_nombre = tk.Label(
+            self.frame, text=nombre, bg="#2d2d3d", fg="#e0e0e0",
+            font=("Segoe UI", 10), anchor=tk.W
+        )
+        self.lbl_nombre.pack(side=tk.LEFT, padx=10, pady=8, fill=tk.X, expand=True)
+        
+        self.menu_btn = tk.Button(
+            self.frame, text="⋮", bg="#2d2d3d", fg="#50fa7b",
+            relief=tk.FLAT, cursor="hand2", font=("Segoe UI", 10),
+            command=self.mostrar_menu
+        )
+        self.menu_btn.pack(side=tk.RIGHT, padx=5)
+        
+        self.frame.bind("<Button-1>", lambda e: self.on_select(self.chat_id))
+        self.lbl_nombre.bind("<Button-1>", lambda e: self.on_select(self.chat_id))
+    
+    def mostrar_menu(self):
+        menu = tk.Menu(self.parent, tearoff=0, bg="#2d2d3d", fg="#e0e0e0")
+        menu.add_command(label="✏️ Cambiar Nombre", command=self.cambiar_nombre)
+        menu.add_separator()
+        menu.add_command(label="Cambiar API Key", command=self.cambiar_api_key)
+        menu.add_command(label="Cambiar Modelo IA", command=self.cambiar_modelo)
+        menu.add_command(label="Cambiar Proveedor IA", command=self.cambiar_proveedor)
+        menu.add_separator()
+        menu.add_command(label="🎭 Cambiar Emoción/Propósito", command=self.cambiar_emocion_proposito)
+        menu.add_separator()
+        menu.add_command(label="Limpiar Chat", command=self.limpiar_chat)
+        menu.add_command(label="Borrar Chat", command=self.borrar_chat)
+        menu.post(self.menu_btn.winfo_rootx(), self.menu_btn.winfo_rooty() + 20)
+    
+    def cambiar_nombre(self):
+        nuevo_nombre = simpledialog.askstring("Cambiar Nombre", "Nuevo nombre:", initialvalue=self.nombre)
+        if nuevo_nombre and nuevo_nombre.strip():
+            self.nombre = nuevo_nombre.strip()
+            self.lbl_nombre.config(text=self.nombre)
+            app = self.parent.master.master.master.master
+            config = cargar_configuracion_chat(self.chat_id)
+            if config:
+                guardar_configuracion_chat(self.chat_id, config["proveedor"], config["modelo"], config["api_key"],
+                                           config.get("emocion", "Neutral"), config.get("proposito", "General"), self.nombre)
+            if app.chat_actual == self.chat_id:
+                app.chat_titulo.config(text=self.nombre)
+            messagebox.showinfo("Éxito", "Nombre actualizado")
+    
+    def cambiar_emocion_proposito(self):
+        app = self.parent.master.master.master.master
+        ventana = tk.Toplevel(self.parent)
+        ventana.title("Editar Personalidad")
+        ventana.geometry("500x550")
+        ventana.configure(bg="#1e1e2e")
+        ventana.transient(self.parent)
+        ventana.grab_set()
+        
+        main_frame = tk.Frame(ventana, bg="#1e1e2e")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        canvas = tk.Canvas(main_frame, bg="#1e1e2e", highlightthickness=0)
+        scrollbar = tk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = tk.Frame(canvas, bg="#1e1e2e")
+        scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw", width=480)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        tk.Label(scrollable_frame, text="Editar Emoción y Propósito", font=("Segoe UI", 14, "bold"),
+                bg="#1e1e2e", fg="#50fa7b").pack(pady=15)
+        
+        emocion_actual = app.emociones.get(self.chat_id, "Neutral")
+        tk.Label(scrollable_frame, text="🎭 Emoción:", font=("Segoe UI", 11, "bold"),
+                bg="#1e1e2e", fg="#ffb86c").pack(pady=(10, 5))
+        emocion_var = tk.StringVar(value=emocion_actual)
+        emociones_frame = tk.Frame(scrollable_frame, bg="#1e1e2e")
+        emociones_frame.pack(pady=5)
+        emociones = ["Neutral", "Feliz 😊", "Triste 😢", "Enojado 😠", "Emocionado 🤩", "Serio 😐", "Sarcástico 😏"]
+        for i, emocion in enumerate(emociones):
+            tk.Radiobutton(emociones_frame, text=emocion, variable=emocion_var, value=emocion,
+                          bg="#1e1e2e", fg="#e0e0e0", selectcolor="#2d2d3d").grid(row=i//2, column=i%2, sticky=tk.W, padx=20, pady=3)
+        
+        proposito_actual = app.propositos.get(self.chat_id, "General")
+        tk.Label(scrollable_frame, text="🎯 Propósito:", font=("Segoe UI", 11, "bold"),
+                bg="#1e1e2e", fg="#ffb86c").pack(pady=(15, 5))
+        proposito_entry = tk.Entry(scrollable_frame, font=("Segoe UI", 11), bg="#3d3d4d", fg="white", width=40)
+        proposito_entry.insert(0, proposito_actual)
+        proposito_entry.pack(pady=5)
+        
+        def guardar_cambios():
+            app.emociones[self.chat_id] = emocion_var.get()
+            app.propositos[self.chat_id] = proposito_entry.get().strip() or "General"
+            config = cargar_configuracion_chat(self.chat_id)
+            if config:
+                guardar_configuracion_chat(self.chat_id, config["proveedor"], config["modelo"], config["api_key"],
+                                           app.emociones[self.chat_id], app.propositos[self.chat_id], config.get("nombre", self.nombre))
+                app.clientes_ia[self.chat_id] = IAClient(config["proveedor"], config["api_key"], config["modelo"])
+            messagebox.showinfo("Éxito", "Personalidad actualizada")
+            ventana.destroy()
+        
+        tk.Button(scrollable_frame, text="Guardar", command=guardar_cambios,
+                 bg="#50fa7b", fg="#1e1e2e", font=("Segoe UI", 11, "bold"),
+                 padx=20, pady=8, relief=tk.FLAT, cursor="hand2").pack(pady=20)
+    
+    def cambiar_api_key(self):
+        nueva_key = simpledialog.askstring("API Key", "Nueva API Key:", show="*")
+        if nueva_key:
+            app = self.parent.master.master.master.master
+            config = cargar_configuracion_chat(self.chat_id)
+            if config:
+                guardar_configuracion_chat(self.chat_id, config["proveedor"], config["modelo"], nueva_key,
+                                           config.get("emocion", "Neutral"), config.get("proposito", "General"),
+                                           config.get("nombre", self.nombre))
+                app.clientes_ia[self.chat_id] = IAClient(config["proveedor"], nueva_key, config["modelo"])
+                messagebox.showinfo("OK", "API Key actualizada")
+    
+    def cambiar_modelo(self):
+        config = cargar_configuracion_chat(self.chat_id)
+        if config:
+            modelos = PROVEEDORES[config["proveedor"]]["modelos"]
+            nuevo_modelo = simpledialog.askstring("Modelo", f"Disponibles: {', '.join(modelos)}")
+            if nuevo_modelo:
+                guardar_configuracion_chat(self.chat_id, config["proveedor"], nuevo_modelo, config["api_key"],
+                                           config.get("emocion", "Neutral"), config.get("proposito", "General"),
+                                           config.get("nombre", self.nombre))
+                app = self.parent.master.master.master.master
+                app.clientes_ia[self.chat_id] = IAClient(config["proveedor"], config["api_key"], nuevo_modelo)
+                messagebox.showinfo("OK", "Modelo actualizado")
+    
+    def cambiar_proveedor(self):
+        nuevo = simpledialog.askstring("Proveedor", f"Opciones: {', '.join(PROVEEDORES.keys())}")
+        if nuevo and nuevo.strip() in PROVEEDORES:
+            config = cargar_configuracion_chat(self.chat_id)
+            if config:
+                api_key = simpledialog.askstring("API Key", "Nueva API Key:", show="*")
+                if api_key:
+                    modelo = PROVEEDORES[nuevo]["default_model"]
+                    guardar_configuracion_chat(self.chat_id, nuevo, modelo, api_key,
+                                               config.get("emocion", "Neutral"), config.get("proposito", "General"),
+                                               config.get("nombre", self.nombre))
+                    app = self.parent.master.master.master.master
+                    app.clientes_ia[self.chat_id] = IAClient(nuevo, api_key, modelo)
+                    messagebox.showinfo("OK", "Proveedor cambiado")
+    
+    def limpiar_chat(self):
+        if messagebox.askyesno("Confirmar", "¿Limpiar todo el chat?"):
+            app = self.parent.master.master.master.master
+            if self.chat_id in app.historiales:
+                app.historiales[self.chat_id] = []
+                guardar_historial(self.chat_id, [])
+            if app.chat_actual == self.chat_id:
+                app.chat_area.config(state=tk.NORMAL)
+                app.chat_area.delete(1.0, tk.END)
+                app.chat_area.config(state=tk.DISABLED)
+            messagebox.showinfo("Éxito", "Chat limpiado correctamente")
+    
+    def borrar_chat(self):
+        if messagebox.askyesno("Confirmar", "¿Borrar este chat?"):
+            app = self.parent.master.master.master.master
+            if os.path.exists(CONFIG_FILE):
+                with open(CONFIG_FILE, "r") as f:
+                    config = json.load(f)
+                if self.chat_id in config:
+                    del config[self.chat_id]
+                with open(CONFIG_FILE, "w") as f:
+                    json.dump(config, f, indent=2)
+            if os.path.exists(HISTORIAL_FILE):
+                with open(HISTORIAL_FILE, "r") as f:
+                    data = json.load(f)
+                if self.chat_id in data:
+                    del data[self.chat_id]
+                with open(HISTORIAL_FILE, "w") as f:
+                    json.dump(data, f, indent=2)
+            if self.chat_id in app.historiales:
+                del app.historiales[self.chat_id]
+            if self.chat_id in app.clientes_ia:
+                del app.clientes_ia[self.chat_id]
+            if self.chat_id in app.chats:
+                del app.chats[self.chat_id]
+            if self in app.widgets_chats:
+                app.widgets_chats.remove(self)
+            self.frame.destroy()
+            if app.chat_actual == self.chat_id:
+                app.chat_actual = None
+                app.chat_area.config(state=tk.NORMAL)
+                app.chat_area.delete(1.0, tk.END)
+                app.chat_area.config(state=tk.DISABLED)
+                app.chat_titulo.config(text="Selecciona un chat")
+                app.chat_info.config(text="")
+            app.canvas_chats.configure(scrollregion=app.canvas_chats.bbox("all"))
+            app.canvas_chats.update_idletasks()
+            messagebox.showinfo("Éxito", "Chat borrado correctamente")
+
+# ==================================================
+# VENTANA PRINCIPAL
+# ==================================================
+
+class HydraCreator:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("🐍 Hydra Creator - Asistente Multi-IA con Proyectos y Terminal")
+        self.root.geometry("1400x800")
+        self.root.configure(bg="#1e1e2e")
+        self.root.minsize(1200, 600)
+        
+        self.chats = {}
+        self.chat_actual = None
+        self.clientes_ia = {}
+        self.historiales = {}
+        self.emociones = {}
+        self.propositos = {}
+        self.widgets_chats = []
+        
+        self.modo_actual = "chats"
+        self.editor_actual = None
+        self.proyecto_panel = None
+        self.code_test_panel = None
+        
+        self.setup_ui()
+        HydraCreator.instance = self
+        self.cargar_chats_guardados()
+    
+    def setup_ui(self):
+        self.left_panel = tk.Frame(self.root, bg="#1e1e2e", width=280)
+        self.left_panel.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 5))
+        self.left_panel.pack_propagate(False)
+        
+        tk.Label(self.left_panel, text="🐍 HYDRA CREATOR", font=("Segoe UI", 16, "bold"),
+                bg="#1e1e2e", fg="#50fa7b").pack(pady=(15, 5))
+        
+        modo_frame = tk.Frame(self.left_panel, bg="#1e1e2e")
+        modo_frame.pack(pady=5, padx=10, fill=tk.X)
+        
+        self.btn_chats = tk.Button(modo_frame, text="💬 CHATS", command=self.mostrar_chats,
+                                   bg="#50fa7b", fg="#1e1e2e", font=("Segoe UI", 10, "bold"),
+                                   relief=tk.FLAT, cursor="hand2")
+        self.btn_chats.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+        
+        self.btn_proyectos = tk.Button(modo_frame, text="📁 PROYECTOS", command=self.mostrar_proyectos,
+                                       bg="#2d2d3d", fg="#e0e0e0", font=("Segoe UI", 10, "bold"),
+                                       relief=tk.FLAT, cursor="hand2")
+        self.btn_proyectos.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+        
+        self.contenido_frame = tk.Frame(self.left_panel, bg="#1e1e2e")
+        self.contenido_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.chats_container = tk.Frame(self.contenido_frame, bg="#1e1e2e")
+        tk.Label(self.chats_container, text="CHATS", font=("Segoe UI", 10, "bold"),
+                bg="#1e1e2e", fg="#ffb86c").pack(pady=(5, 5))
+        
+        self.btn_nuevo_chat = tk.Button(self.chats_container, text="➕ Nuevo Chat",
+                                         command=self.mostrar_configuracion_chat,
+                                         bg="#50fa7b", fg="#1e1e2e",
+                                         font=("Segoe UI", 10, "bold"),
+                                         relief=tk.FLAT, cursor="hand2")
+        self.btn_nuevo_chat.pack(pady=(5, 10), padx=10, fill=tk.X)
+        
+        self.chats_frame = tk.Frame(self.chats_container, bg="#1e1e2e")
+        self.chats_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.canvas_chats = tk.Canvas(self.chats_frame, bg="#1e1e2e", highlightthickness=0)
+        self.scrollbar_chats = tk.Scrollbar(self.chats_frame, orient="vertical", command=self.canvas_chats.yview)
+        self.scrollable_chats = tk.Frame(self.canvas_chats, bg="#1e1e2e")
+        
+        self.scrollable_chats.bind("<Configure>", lambda e: self.canvas_chats.configure(scrollregion=self.canvas_chats.bbox("all")))
+        self.canvas_chats.create_window((0, 0), window=self.scrollable_chats, anchor="nw", width=260)
+        self.canvas_chats.configure(yscrollcommand=self.scrollbar_chats.set)
+        
+        self.canvas_chats.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.scrollbar_chats.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        self.right_panel = tk.Frame(self.root, bg="#2d2d3d")
+        self.right_panel.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        
+        self.chat_frame = tk.Frame(self.right_panel, bg="#2d2d3d")
+        self.setup_chat_ui()
+        
+        self.mostrar_chats()
+    
+    def obtener_ia_del_chat_mas_reciente(self):
+        chat_id_reciente = obtener_chat_mas_reciente()
+        if chat_id_reciente and chat_id_reciente in self.clientes_ia:
+            config = cargar_configuracion_chat(chat_id_reciente)
+            nombre = config.get("nombre", "Chat sin nombre") if config else "Chat sin nombre"
+            return self.clientes_ia[chat_id_reciente], nombre
+        return None, None
+    
+    def setup_chat_ui(self):
+        for widget in self.chat_frame.winfo_children():
+            widget.destroy()
+        
+        self.header_frame = tk.Frame(self.chat_frame, bg="#2d2d3d", height=50)
+        self.header_frame.pack(fill=tk.X, padx=10, pady=10)
+        self.header_frame.pack_propagate(False)
+        
+        self.chat_titulo = tk.Label(self.header_frame, text="Selecciona un chat",
+                                     bg="#2d2d3d", fg="#ffb86c",
+                                     font=("Segoe UI", 14, "bold"))
+        self.chat_titulo.pack(side=tk.LEFT, padx=10)
+        
+        self.chat_info = tk.Label(self.header_frame, text="",
+                                   bg="#2d2d3d", fg="#8b949e",
+                                   font=("Segoe UI", 9))
+        self.chat_info.pack(side=tk.LEFT, padx=10)
+        
+        self.chat_area = scrolledtext.ScrolledText(
+            self.chat_frame, wrap=tk.WORD, font=("Segoe UI", 11),
+            bg="#2d2d3d", fg="#e0e0e0", insertbackground="white",
+            relief=tk.FLAT, padx=15, pady=15
+        )
+        self.chat_area.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.chat_area.config(state=tk.DISABLED)
+        
+        self.chat_area.tag_config("usuario", foreground="#50fa7b", font=("Segoe UI", 11, "bold"))
+        self.chat_area.tag_config("asistente", foreground="#ffb86c", font=("Segoe UI", 11, "bold"))
+        self.chat_area.tag_config("normal", foreground="#e0e0e0", font=("Segoe UI", 11))
+        
+        input_frame = tk.Frame(self.chat_frame, bg="#2d2d3d")
+        input_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+        
+        self.entrada = tk.Text(input_frame, height=3, font=("Segoe UI", 11),
+                                bg="#3d3d4d", fg="#f8f8f2", insertbackground="white",
+                                wrap=tk.WORD, relief=tk.FLAT, padx=10, pady=8)
+        self.entrada.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+        self.entrada.bind("<Return>", self.enviar_mensaje_event)
+        self.entrada.bind("<Shift-Return>", lambda e: None)
+        
+        self.boton_enviar = tk.Button(
+            input_frame, text="📤 Enviar (Enter)", command=self.enviar_mensaje,
+            bg="#50fa7b", fg="#1e1e2e", font=("Segoe UI", 10, "bold"),
+            activebackground="#40da6b", cursor="hand2", padx=20, pady=10,
+            relief=tk.FLAT
+        )
+        self.boton_enviar.pack(side=tk.RIGHT)
+        
+        self.status_label = tk.Label(self.chat_frame, text="Hydra Creator lista",
+                                      bg="#2d2d3d", fg="#50fa7b", font=("Segoe UI", 9))
+        self.status_label.pack(side=tk.BOTTOM, pady=5)
+    
+    def mostrar_chats(self):
+        self.modo_actual = "chats"
+        self.btn_chats.config(bg="#50fa7b", fg="#1e1e2e")
+        self.btn_proyectos.config(bg="#2d2d3d", fg="#e0e0e0")
+        
+        if self.proyecto_panel:
+            self.proyecto_panel.frame.pack_forget()
+        
+        self.chats_container.pack(fill=tk.BOTH, expand=True)
+        
+        if self.editor_actual:
+            self.editor_actual.frame.destroy()
+            self.editor_actual = None
+        
+        self.chat_frame.pack(fill=tk.BOTH, expand=True)
+    
+    def mostrar_proyectos(self):
+        self.modo_actual = "proyectos"
+        self.btn_proyectos.config(bg="#50fa7b", fg="#1e1e2e")
+        self.btn_chats.config(bg="#2d2d3d", fg="#e0e0e0")
+        
+        self.chats_container.pack_forget()
+        self.chat_frame.pack_forget()
+        
+        if not self.proyecto_panel:
+            self.proyecto_panel = ProyectoPanel(self.contenido_frame, self.abrir_proyecto, self.obtener_ia_del_chat_mas_reciente)
+        else:
+            self.proyecto_panel.frame.pack(fill=tk.BOTH, expand=True)
+    
+    def abrir_proyecto(self, proyecto_id, datos):
+        if self.editor_actual:
+            self.editor_actual.frame.destroy()
+        
+        self.editor_actual = EditorProyecto(self.right_panel, proyecto_id, datos, self.obtener_ia_del_chat_mas_reciente)
+        self.chat_frame.pack_forget()
+    
+    def cargar_chats_guardados(self):
+        chats = obtener_todos_chats()
+        for chat_id, config in chats.items():
+            if isinstance(config, dict) and "proveedor" in config:
+                nombre = config.get("nombre", f"Chat {chat_id[:8]}")
+                proveedor = config["proveedor"]
+                modelo = config.get("modelo", PROVEEDORES[proveedor]["default_model"])
+                
+                config_completa = cargar_configuracion_chat(chat_id)
+                if config_completa is None:
+                    continue
+                
+                api_key = config_completa.get("api_key")
+                emocion = config_completa.get("emocion", "Neutral")
+                proposito = config_completa.get("proposito", "General")
+                
+                self.crear_chat_widget(chat_id, nombre)
+                self.clientes_ia[chat_id] = IAClient(proveedor, api_key, modelo)
+                self.historiales[chat_id] = cargar_historial(chat_id)
+                self.emociones[chat_id] = emocion
+                self.propositos[chat_id] = proposito
+    
+    def crear_chat_widget(self, chat_id, nombre):
+        widget = ChatWidget(self.scrollable_chats, chat_id, nombre, self.seleccionar_chat)
+        self.widgets_chats.append(widget)
+        self.chats[chat_id] = widget
+    
+    def seleccionar_chat(self, chat_id):
+        self.chat_actual = chat_id
+        actualizar_fecha_uso_chat(chat_id)
+        
+        config = cargar_configuracion_chat(chat_id)
+        if config:
+            nombre = config.get("nombre", f"Chat {chat_id[:8]}")
+            emocion = self.emociones.get(chat_id, config.get("emocion", "Neutral"))
+            proposito = self.propositos.get(chat_id, config.get("proposito", "General"))
+            self.chat_titulo.config(text=nombre)
+            self.chat_info.config(text=f"{PROVEEDORES[config['proveedor']]['nombre']} - {config['modelo']} | 🎭 {emocion} | 🎯 {proposito}")
+        
+        self.chat_area.config(state=tk.NORMAL)
+        self.chat_area.delete(1.0, tk.END)
+        
+        if chat_id in self.historiales:
+            for msg in self.historiales[chat_id]:
+                tag = "usuario" if msg["rol"] == "usuario" else "asistente"
+                self.chat_area.insert(tk.END, f"\n{msg['nombre']}\n", tag)
+                self.chat_area.insert(tk.END, "─" * 40 + "\n", "normal")
+                self._insertar_texto_con_codigo(msg["texto"])
+                self.chat_area.insert(tk.END, "\n", "normal")
+        
+        self.chat_area.config(state=tk.DISABLED)
+        self.chat_area.see(tk.END)
+        self.entrada.focus_set()
+    
+    def _insertar_texto_con_codigo(self, texto):
+        patron = r'```(\w+)?\n([\s\S]*?)```'
+        matches = list(re.finditer(patron, texto))
+        last_end = 0
+        
+        for match in matches:
+            start, end = match.span()
+            lenguaje = match.group(1) or "text"
+            codigo = match.group(2).strip()
+            
+            texto_normal = texto[last_end:start].strip()
+            if texto_normal:
+                self.chat_area.insert(tk.END, texto_normal + "\n\n", "normal")
+            
+            card = self._crear_card_codigo(lenguaje, codigo)
+            self.chat_area.window_create(tk.END, window=card)
+            self.chat_area.insert(tk.END, "\n\n")
+            last_end = end
+        
+        restante = texto[last_end:].strip()
+        if restante:
+            self.chat_area.insert(tk.END, restante + "\n", "normal")
+    
+    def _crear_card_codigo(self, lenguaje, codigo):
+        card = tk.Frame(self.chat_area, bg="#161b22", bd=1, relief=tk.FLAT)
+        header = tk.Frame(card, bg="#0d1117", height=35)
+        header.pack(fill=tk.X)
+        header.pack_propagate(False)
+        
+        lbl = tk.Label(header, text=lenguaje.capitalize(), bg="#0d1117", fg="#8b949e", font=("Segoe UI", 9, "bold"))
+        lbl.pack(side=tk.LEFT, padx=10)
+        
+        btn_frame = tk.Frame(header, bg="#0d1117")
+        btn_frame.pack(side=tk.RIGHT, padx=5)
+        
+        btn_copy = tk.Button(btn_frame, text="📋", command=lambda: self.copiar_codigo(codigo),
+                             bg="#21262d", fg="#c9d1d9", relief=tk.FLAT, cursor="hand2", padx=6)
+        btn_copy.pack(side=tk.LEFT, padx=3)
+        
+        btn_test = tk.Button(btn_frame, text="🧪 PROBAR", 
+                              command=lambda: self.probar_codigo(codigo, lenguaje),
+                              bg="#50fa7b", fg="#1e1e2e", relief=tk.FLAT, cursor="hand2", padx=6, font=("Segoe UI", 8, "bold"))
+        btn_test.pack(side=tk.LEFT, padx=3)
+        
+        code = tk.Text(card, bg="#161b22", fg="#e6edf3", font=("Consolas", 10),
+                       wrap=tk.NONE, relief=tk.FLAT, padx=10, pady=8,
+                       height=min(20, codigo.count("\n") + 2))
+        code.insert("1.0", codigo)
+        code.config(state=tk.DISABLED)
+        code.pack(fill=tk.BOTH, expand=True)
+        return card
+    
+    def probar_codigo(self, codigo, lenguaje):
+        self.chat_frame.pack_forget()
+        ia_client, _ = self.obtener_ia_del_chat_mas_reciente()
+        self.code_test_panel = CodeTestPanel(self.right_panel, codigo, lenguaje, self.salir_modo_prueba, ia_client)
+    
+    def salir_modo_prueba(self):
+        self.code_test_panel = None
+        if self.modo_actual == "chats":
+            self.chat_frame.pack(fill=tk.BOTH, expand=True)
+    
+    def copiar_codigo(self, codigo):
+        try:
+            pyperclip.copy(codigo)
+            self.mostrar_notificacion("✅ Código copiado!")
+        except:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(codigo)
+            self.mostrar_notificacion("✅ Código copiado!")
+    
+    def mostrar_configuracion_chat(self):
+        VentanaConfiguracionChat(self.root, self.crear_nuevo_chat)
+    
+    def crear_nuevo_chat(self, nombre, proveedor, modelo, api_key, emocion, propositos):
+        import time
+        chat_id = str(int(time.time()))
+        proposito_str = ", ".join(propositos)
+        
+        guardar_configuracion_chat(chat_id, proveedor, modelo, api_key, emocion, proposito_str, nombre)
+        self.crear_chat_widget(chat_id, nombre)
+        self.clientes_ia[chat_id] = IAClient(proveedor, api_key, modelo)
+        self.historiales[chat_id] = []
+        self.emociones[chat_id] = emocion
+        self.propositos[chat_id] = proposito_str
+        
+        self.seleccionar_chat(chat_id)
+    
+    def mostrar_notificacion(self, mensaje, es_error=False):
+        color = "#ff5555" if es_error else "#50fa7b"
+        self.status_label.config(text=mensaje, fg=color)
+        self.root.after(2000, lambda: self.status_label.config(text="Hydra Creator lista", fg="#50fa7b"))
+    
+    def agregar_mensaje(self, quien, texto, es_usuario=False):
+        if not self.chat_actual:
+            return
+        
+        self.chat_area.config(state=tk.NORMAL)
+        tag = "usuario" if es_usuario else "asistente"
+        self.chat_area.insert(tk.END, f"\n{quien}\n", tag)
+        self.chat_area.insert(tk.END, "─" * 40 + "\n", "normal")
+        self._insertar_texto_con_codigo(texto)
+        self.chat_area.insert(tk.END, "\n", "normal")
+        self.chat_area.config(state=tk.DISABLED)
+        self.chat_area.see(tk.END)
+        
+        self.historiales[self.chat_actual].append({
+            "rol": "usuario" if es_usuario else "asistente",
+            "nombre": quien,
+            "texto": texto
+        })
+        guardar_historial(self.chat_actual, self.historiales[self.chat_actual])
+    
+    def enviar_mensaje_event(self, event):
+        if not event.state & 0x1:
+            self.enviar_mensaje()
+            return "break"
+    
+    def enviar_mensaje(self):
+        if not self.chat_actual:
+            self.mostrar_notificacion("Selecciona un chat primero")
+            return
+        
+        mensaje = self.entrada.get("1.0", tk.END).strip()
+        if not mensaje:
+            return
+        
+        self.entrada.delete("1.0", tk.END)
+        self.agregar_mensaje("👤 Tú", mensaje, es_usuario=True)
+        
+        self.boton_enviar.config(state=tk.DISABLED, text="💭 Pensando...")
+        self.mostrar_notificacion("Hydra Creator está pensando...")
+        self.root.update()
+        
+        def obtener():
+            cliente = self.clientes_ia.get(self.chat_actual)
+            if cliente:
+                historial = self.historiales.get(self.chat_actual, [])[-10:]
+                emocion = self.emociones.get(self.chat_actual, "Neutral")
+                proposito = self.propositos.get(self.chat_actual, "General")
+                respuesta = cliente.enviar_mensaje_con_historial(mensaje, historial, emocion, proposito)
+                self.root.after(0, lambda: self._mostrar_respuesta(respuesta))
+        
+        threading.Thread(target=obtener, daemon=True).start()
+    
+    def _mostrar_respuesta(self, respuesta):
+        self.agregar_mensaje("🐍 Hydra Creator", respuesta, es_usuario=False)
+        self.boton_enviar.config(state=tk.NORMAL, text="📤 Enviar (Enter)")
+        self.mostrar_notificacion("Respuesta recibida")
+        self.entrada.focus_set()
+
+# ==================================================
+# CLASE DE PRUEBA DE CÓDIGO (COMPLETA)
+# ==================================================
+
+class CodeTestPanel:
+    def __init__(self, parent, codigo, lenguaje, on_close, ia_client=None):
+        self.parent = parent
+        self.codigo_original = codigo
+        self.lenguaje_original = lenguaje
+        self.lenguaje_actual = lenguaje
+        self.on_close = on_close
+        self.ia_client = ia_client
+        self.proceso_ejecucion = None
+        self.corrigiendo = False
+        self.intento_correccion = 0
+        
+        self.frame = tk.Frame(parent, bg="#1e1e2e")
+        self.frame.pack(fill=tk.BOTH, expand=True)
+        
+        header_frame = tk.Frame(self.frame, bg="#2d2d3d", height=50)
+        header_frame.pack(fill=tk.X, padx=10, pady=10)
+        header_frame.pack_propagate(False)
+        
+        tk.Label(header_frame, text="🧪 MODO PRUEBA DE CÓDIGO", 
+                font=("Segoe UI", 14, "bold"),
+                bg="#2d2d3d", fg="#50fa7b").pack(side=tk.LEFT, padx=15)
+        
+        lenguaje_frame = tk.Frame(header_frame, bg="#2d2d3d")
+        lenguaje_frame.pack(side=tk.LEFT, padx=15)
+        
+        tk.Label(lenguaje_frame, text="Lenguaje:", font=("Segoe UI", 10),
+                bg="#2d2d3d", fg="#ffb86c").pack(side=tk.LEFT)
+        
+        self.lenguaje_var = tk.StringVar(value=lenguaje.lower())
+        lenguajes = ["python", "javascript", "bash", "html", "css", "json", "sql", "java", "cpp", "csharp", "php", "ruby", "go"]
+        self.lenguaje_combo = ttk.Combobox(lenguaje_frame, textvariable=self.lenguaje_var, 
+                                            values=lenguajes, width=12, state="readonly")
+        self.lenguaje_combo.pack(side=tk.LEFT, padx=5)
+        self.lenguaje_combo.bind("<<ComboboxSelected>>", self.cambiar_lenguaje_con_ia)
+        
+        btn_salir = tk.Button(header_frame, text="🚪 Abandonar Prueba", 
+                              command=self.salir, bg="#ff5555", fg="white",
+                              font=("Segoe UI", 10, "bold"), padx=15, pady=5,
+                              relief=tk.FLAT, cursor="hand2")
+        btn_salir.pack(side=tk.RIGHT, padx=15)
+        
+        main_panel = tk.Frame(self.frame, bg="#1e1e2e")
+        main_panel.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        left_frame = tk.Frame(main_panel, bg="#1e1e2e")
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        
+        tk.Label(left_frame, text="📝 CÓDIGO", font=("Segoe UI", 10, "bold"),
+                bg="#1e1e2e", fg="#50fa7b").pack(anchor=tk.W, pady=(0, 5))
+        
+        self.code_editor = scrolledtext.ScrolledText(
+            left_frame, wrap=tk.NONE, font=("Consolas", 11),
+            bg="#2d2d3d", fg="#e0e0e0", insertbackground="white",
+            relief=tk.FLAT, padx=10, pady=10
+        )
+        self.code_editor.pack(fill=tk.BOTH, expand=True)
+        self.code_editor.insert("1.0", codigo)
+        
+        btn_frame = tk.Frame(left_frame, bg="#1e1e2e")
+        btn_frame.pack(fill=tk.X, pady=(10, 0))
+        
+        btn_ejecutar = tk.Button(btn_frame, text="▶ EJECUTAR", command=self.ejecutar_codigo,
+                                  bg="#50fa7b", fg="#1e1e2e", font=("Segoe UI", 10, "bold"),
+                                  padx=15, pady=5, relief=tk.FLAT, cursor="hand2")
+        btn_ejecutar.pack(side=tk.LEFT, padx=5)
+        
+        btn_limpiar = tk.Button(btn_frame, text="🗑 LIMPIAR", command=self.limpiar_salida,
+                                 bg="#ffb86c", fg="#1e1e2e", font=("Segoe UI", 10, "bold"),
+                                 padx=15, pady=5, relief=tk.FLAT, cursor="hand2")
+        btn_limpiar.pack(side=tk.LEFT, padx=5)
+        
+        btn_copiar = tk.Button(btn_frame, text="📋 COPIAR", command=self.copiar_codigo,
+                                bg="#6272a4", fg="white", font=("Segoe UI", 10, "bold"),
+                                padx=15, pady=5, relief=tk.FLAT, cursor="hand2")
+        btn_copiar.pack(side=tk.LEFT, padx=5)
+        
+        btn_guardar = tk.Button(btn_frame, text="💾 GUARDAR", command=self.guardar_codigo,
+                                 bg="#8be9fd", fg="#1e1e2e", font=("Segoe UI", 10, "bold"),
+                                 padx=15, pady=5, relief=tk.FLAT, cursor="hand2")
+        btn_guardar.pack(side=tk.LEFT, padx=5)
+        
+        info_frame = tk.Frame(self.frame, bg="#1e1e2e")
+        info_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+        
+        self.info_label = tk.Label(info_frame, text=f"💡 Código original en: {lenguaje.capitalize()}", 
+                                    bg="#1e1e2e", fg="#8b949e", font=("Segoe UI", 9))
+        self.info_label.pack(side=tk.LEFT)
+        
+        right_frame = tk.Frame(main_panel, bg="#1e1e2e")
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
+        
+        tk.Label(right_frame, text="📤 RESULTADO", font=("Segoe UI", 10, "bold"),
+                bg="#1e1e2e", fg="#ffb86c").pack(anchor=tk.W, pady=(0, 5))
+        
+        self.output_area = scrolledtext.ScrolledText(
+            right_frame, wrap=tk.WORD, font=("Consolas", 11),
+            bg="#0d1117", fg="#e0e0e0", insertbackground="white",
+            relief=tk.FLAT, padx=10, pady=10
+        )
+        self.output_area.pack(fill=tk.BOTH, expand=True)
+        
+        self.output_area.tag_config("titulo", foreground="#50fa7b", font=("Segoe UI", 10, "bold"))
+        self.output_area.tag_config("error", foreground="#ff5555")
+        self.output_area.tag_config("resultado", foreground="#f1fa8c")
+        self.output_area.tag_config("linea", foreground="#6272a4")
+        self.output_area.tag_config("ejecutando", foreground="#ffb86c")
+        self.output_area.tag_config("info", foreground="#8be9fd")
+        self.output_area.tag_config("correccion", foreground="#50fa7b", font=("Segoe UI", 10, "bold"))
+    
+    def _obtener_cliente_rapido(self):
+        if self.ia_client and self.ia_client.proveedor == "groq":
+            return self.ia_client
+        if hasattr(HydraCreator, 'instance') and HydraCreator.instance:
+            app = HydraCreator.instance
+            for chat_id, cliente in app.clientes_ia.items():
+                if cliente.proveedor == "groq":
+                    return cliente
+        return self.ia_client
+    
+    def cambiar_lenguaje_con_ia(self, event=None):
+        nuevo_lenguaje = self.lenguaje_var.get()
+        codigo_actual = self.code_editor.get("1.0", tk.END).strip()
+        
+        if not codigo_actual:
+            self.output_area.insert(tk.END, "❌ No hay código para convertir\n", "error")
+            return
+        
+        if self.lenguaje_actual == nuevo_lenguaje:
+            return
+        
+        self.output_area.delete("1.0", tk.END)
+        self.output_area.insert(tk.END, f"🤖 Usando IA para convertir de {self.lenguaje_actual} a {nuevo_lenguaje}...\n\n", "ejecutando")
+        self.output_area.see(tk.END)
+        
+        cliente_rapido = self._obtener_cliente_rapido()
+        if not cliente_rapido:
+            self.output_area.insert(tk.END, "❌ No hay IA disponible para conversión.\n", "error")
+            return
+        
+        def convertir_con_ia():
+            codigo_convertido = cliente_rapido.convertir_codigo_con_ia(
+                codigo_actual, self.lenguaje_actual, nuevo_lenguaje
+            )
+            if codigo_convertido:
+                self.parent.after(0, lambda: self._aplicar_conversion(codigo_convertido, nuevo_lenguaje, cliente_rapido.proveedor))
+            else:
+                self.parent.after(0, lambda: self.output_area.insert(tk.END, "❌ Error en la conversión con IA\n", "error"))
+        
+        threading.Thread(target=convertir_con_ia, daemon=True).start()
+    
+    def _aplicar_conversion(self, codigo_convertido, nuevo_lenguaje, proveedor_usado):
+        if codigo_convertido:
+            self.code_editor.delete("1.0", tk.END)
+            self.code_editor.insert("1.0", codigo_convertido)
+            self.info_label.config(text=f"💡 Convertido a {nuevo_lenguaje.capitalize()} usando {proveedor_usado.upper()}")
+            self.lenguaje_actual = nuevo_lenguaje
+            self.output_area.delete("1.0", tk.END)
+            self.output_area.insert(tk.END, f"✅ Conversión exitosa usando {proveedor_usado.upper()}\n", "titulo")
+            self.output_area.insert(tk.END, "─" * 40 + "\n", "linea")
+            self.output_area.insert(tk.END, codigo_convertido + "\n\n", "resultado")
+            self.output_area.insert(tk.END, "✨ Ejecutando código convertido...\n", "correccion")
+            self.output_area.see(tk.END)
+            self.ejecutar_codigo()
+        else:
+            self.output_area.delete("1.0", tk.END)
+            self.output_area.insert(tk.END, "❌ Error en la conversión con IA\n", "error")
+        self.output_area.see(tk.END)
+    
+    def ejecutar_codigo(self):
+        codigo = self.code_editor.get("1.0", tk.END).strip()
+        lenguaje = self.lenguaje_actual
+        
+        if not codigo:
+            self.output_area.insert(tk.END, "❌ No hay código para ejecutar\n")
+            self.output_area.see(tk.END)
+            return
+        
+        self.output_area.delete("1.0", tk.END)
+        self.output_area.insert(tk.END, f"🔄 Ejecutando código {lenguaje}...\n\n", "ejecutando")
+        self.output_area.see(tk.END)
+        
+        if lenguaje == "python":
+            self.ejecutar_python_con_correccion(codigo)
+        elif lenguaje == "javascript":
+            self.ejecutar_javascript_con_correccion(codigo)
+        elif lenguaje == "bash":
+            self.ejecutar_bash_con_correccion(codigo)
+        elif lenguaje == "html":
+            self.ejecutar_html(codigo)
+        else:
+            self.ejecutar_generico(codigo, lenguaje)
+    
+    def ejecutar_python_con_correccion(self, codigo, intento=1):
+        output_buffer = io.StringIO()
+        ejecucion_exitosa = False
+        resultado = ""
+        error_msg = ""
+        
+        try:
+            with contextlib.redirect_stdout(output_buffer):
+                with contextlib.redirect_stderr(output_buffer):
+                    exec(codigo, {"__name__": "__main__"}, {})
+            
+            resultado = output_buffer.getvalue()
+            ejecucion_exitosa = True
+            
+        except Exception as e:
+            error_msg = str(e)
+            ejecucion_exitosa = False
+        
+        if ejecucion_exitosa:
+            if resultado:
+                self.output_area.delete("1.0", tk.END)
+                self.output_area.insert(tk.END, "✅ RESULTADO (Python):\n", "titulo")
+                self.output_area.insert(tk.END, "─" * 40 + "\n", "linea")
+                self.output_area.insert(tk.END, resultado + "\n", "resultado")
+                self.output_area.insert(tk.END, "\n✨ El código funciona correctamente!\n", "correccion")
+            else:
+                self.output_area.delete("1.0", tk.END)
+                self.output_area.insert(tk.END, "✅ Código Python ejecutado correctamente (sin salida)\n", "resultado")
+                self.output_area.insert(tk.END, "\n✨ El código funciona correctamente!\n", "correccion")
+            self.corrigiendo = False
+        else:
+            if intento <= 3 and self.ia_client and not self.corrigiendo:
+                self.corrigiendo = True
+                self.intento_correccion = intento
+                self.output_area.delete("1.0", tk.END)
+                self.output_area.insert(tk.END, f"⚠️ Error detectado (intento {intento}):\n", "error")
+                self.output_area.insert(tk.END, "─" * 40 + "\n", "linea")
+                self.output_area.insert(tk.END, f"{error_msg}\n\n", "error")
+                self.output_area.insert(tk.END, f"🔧 La IA está corrigiendo el código (intento {intento}/3)...\n\n", "correccion")
+                self.output_area.see(tk.END)
+                
+                cliente_corrector = self._obtener_cliente_rapido()
+                def corregir():
+                    codigo_corregido = cliente_corrector.corregir_codigo_con_ia(codigo, "python", error_msg, intento) if cliente_corrector else None
+                    if codigo_corregido and codigo_corregido != codigo:
+                        self.parent.after(0, lambda: self._aplicar_correccion(codigo_corregido, "python", intento + 1))
+                    else:
+                        if intento < 3:
+                            self.parent.after(0, lambda: self._reintentar_con_mismo_error(codigo, "python", error_msg, intento))
+                        else:
+                            self.parent.after(0, lambda: self._mostrar_error_sin_correccion(error_msg))
+                
+                threading.Thread(target=corregir, daemon=True).start()
+            elif intento <= 3 and self.ia_client:
+                self.parent.after(0, lambda: self._reintentar_con_mismo_error(codigo, "python", error_msg, intento))
+            else:
+                self.output_area.delete("1.0", tk.END)
+                self.output_area.insert(tk.END, "❌ ERROR EN PYTHON (después de múltiples intentos):\n", "error")
+                self.output_area.insert(tk.END, "─" * 40 + "\n", "linea")
+                self.output_area.insert(tk.END, error_msg + "\n", "error")
+                self.output_area.insert(tk.END, "\n⚠️ No se pudo corregir el código automáticamente.\n", "error")
+                self.corrigiendo = False
+        
+        self.output_area.see(tk.END)
+    
+    def ejecutar_javascript_con_correccion(self, codigo, intento=1):
+        ejecucion_exitosa = False
+        resultado = ""
+        error_msg = ""
+        
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.js', delete=False, encoding='utf-8') as f:
+                f.write(codigo)
+                temp_file = f.name
+            
+            resultado_proc = subprocess.run(['node', temp_file], capture_output=True, text=True, timeout=10)
+            os.unlink(temp_file)
+            
+            if resultado_proc.returncode == 0:
+                ejecucion_exitosa = True
+                resultado = resultado_proc.stdout
+            else:
+                error_msg = resultado_proc.stderr
+        
+        except FileNotFoundError:
+            error_msg = "Node.js no está instalado"
+        except subprocess.TimeoutExpired:
+            error_msg = "Timeout - El código tardó demasiado en ejecutarse"
+        except Exception as e:
+            error_msg = str(e)
+        
+        if ejecucion_exitosa:
+            self.output_area.delete("1.0", tk.END)
+            self.output_area.insert(tk.END, "✅ RESULTADO (JavaScript):\n", "titulo")
+            self.output_area.insert(tk.END, "─" * 40 + "\n", "linea")
+            self.output_area.insert(tk.END, resultado + "\n", "resultado")
+            if resultado_proc.stderr and resultado_proc.stderr.strip():
+                self.output_area.insert(tk.END, "\n⚠️ ADVERTENCIAS:\n", "error")
+                self.output_area.insert(tk.END, resultado_proc.stderr + "\n", "error")
+            self.output_area.insert(tk.END, "\n✨ El código funciona correctamente!\n", "correccion")
+            self.corrigiendo = False
+        else:
+            if intento <= 3 and self.ia_client and not self.corrigiendo:
+                self.corrigiendo = True
+                self.intento_correccion = intento
+                self.output_area.delete("1.0", tk.END)
+                self.output_area.insert(tk.END, f"⚠️ Error detectado (intento {intento}):\n", "error")
+                self.output_area.insert(tk.END, "─" * 40 + "\n", "linea")
+                self.output_area.insert(tk.END, f"{error_msg}\n\n", "error")
+                self.output_area.insert(tk.END, f"🔧 La IA está corrigiendo el código (intento {intento}/3)...\n\n", "correccion")
+                self.output_area.see(tk.END)
+                
+                cliente_corrector = self._obtener_cliente_rapido()
+                def corregir():
+                    codigo_corregido = cliente_corrector.corregir_codigo_con_ia(codigo, "javascript", error_msg, intento) if cliente_corrector else None
+                    if codigo_corregido and codigo_corregido != codigo:
+                        self.parent.after(0, lambda: self._aplicar_correccion(codigo_corregido, "javascript", intento + 1))
+                    else:
+                        if intento < 3:
+                            self.parent.after(0, lambda: self._reintentar_con_mismo_error(codigo, "javascript", error_msg, intento))
+                        else:
+                            self.parent.after(0, lambda: self._mostrar_error_sin_correccion(error_msg))
+                
+                threading.Thread(target=corregir, daemon=True).start()
+            elif intento <= 3 and self.ia_client:
+                self.parent.after(0, lambda: self._reintentar_con_mismo_error(codigo, "javascript", error_msg, intento))
+            else:
+                self.output_area.delete("1.0", tk.END)
+                self.output_area.insert(tk.END, "❌ ERROR EN JAVASCRIPT (después de múltiples intentos):\n", "error")
+                self.output_area.insert(tk.END, "─" * 40 + "\n", "linea")
+                self.output_area.insert(tk.END, error_msg + "\n", "error")
+                self.output_area.insert(tk.END, "\n⚠️ No se pudo corregir el código automáticamente.\n", "error")
+                self.corrigiendo = False
+        
+        self.output_area.see(tk.END)
+    
+    def ejecutar_bash_con_correccion(self, codigo, intento=1):
+        ejecucion_exitosa = False
+        resultado = ""
+        error_msg = ""
+        
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False, encoding='utf-8') as f:
+                if not codigo.startswith('#!/bin/bash') and not codigo.startswith('#!/bin/sh'):
+                    codigo = "#!/bin/bash\n" + codigo
+                f.write(codigo)
+                temp_file = f.name
+            
+            os.chmod(temp_file, 0o755)
+            resultado_proc = subprocess.run(['bash', temp_file], capture_output=True, text=True, timeout=10)
+            os.unlink(temp_file)
+            
+            if resultado_proc.returncode == 0:
+                ejecucion_exitosa = True
+                resultado = resultado_proc.stdout
+            else:
+                error_msg = resultado_proc.stderr
+        
+        except subprocess.TimeoutExpired:
+            error_msg = "Timeout - El código tardó demasiado en ejecutarse"
+        except Exception as e:
+            error_msg = str(e)
+        
+        if ejecucion_exitosa:
+            self.output_area.delete("1.0", tk.END)
+            self.output_area.insert(tk.END, "✅ RESULTADO (Bash):\n", "titulo")
+            self.output_area.insert(tk.END, "─" * 40 + "\n", "linea")
+            self.output_area.insert(tk.END, resultado + "\n", "resultado")
+            if resultado_proc.stderr and resultado_proc.stderr.strip():
+                self.output_area.insert(tk.END, "\n⚠️ ADVERTENCIAS:\n", "error")
+                self.output_area.insert(tk.END, resultado_proc.stderr + "\n", "error")
+            self.output_area.insert(tk.END, "\n✨ El código funciona correctamente!\n", "correccion")
+            self.corrigiendo = False
+        else:
+            if intento <= 3 and self.ia_client and not self.corrigiendo:
+                self.corrigiendo = True
+                self.intento_correccion = intento
+                self.output_area.delete("1.0", tk.END)
+                self.output_area.insert(tk.END, f"⚠️ Error detectado (intento {intento}):\n", "error")
+                self.output_area.insert(tk.END, "─" * 40 + "\n", "linea")
+                self.output_area.insert(tk.END, f"{error_msg}\n\n", "error")
+                self.output_area.insert(tk.END, f"🔧 La IA está corrigiendo el código (intento {intento}/3)...\n\n", "correccion")
+                self.output_area.see(tk.END)
+                
+                cliente_corrector = self._obtener_cliente_rapido()
+                def corregir():
+                    codigo_corregido = cliente_corrector.corregir_codigo_con_ia(codigo, "bash", error_msg, intento) if cliente_corrector else None
+                    if codigo_corregido and codigo_corregido != codigo:
+                        self.parent.after(0, lambda: self._aplicar_correccion(codigo_corregido, "bash", intento + 1))
+                    else:
+                        if intento < 3:
+                            self.parent.after(0, lambda: self._reintentar_con_mismo_error(codigo, "bash", error_msg, intento))
+                        else:
+                            self.parent.after(0, lambda: self._mostrar_error_sin_correccion(error_msg))
+                
+                threading.Thread(target=corregir, daemon=True).start()
+            elif intento <= 3 and self.ia_client:
+                self.parent.after(0, lambda: self._reintentar_con_mismo_error(codigo, "bash", error_msg, intento))
+            else:
+                self.output_area.delete("1.0", tk.END)
+                self.output_area.insert(tk.END, "❌ ERROR EN BASH (después de múltiples intentos):\n", "error")
+                self.output_area.insert(tk.END, "─" * 40 + "\n", "linea")
+                self.output_area.insert(tk.END, error_msg + "\n", "error")
+                self.output_area.insert(tk.END, "\n⚠️ No se pudo corregir el código automáticamente.\n", "error")
+                self.corrigiendo = False
+        
+        self.output_area.see(tk.END)
+    
+    def _aplicar_correccion(self, codigo_corregido, lenguaje, siguiente_intento):
+        self.code_editor.delete("1.0", tk.END)
+        self.code_editor.insert("1.0", codigo_corregido)
+        
+        self.output_area.delete("1.0", tk.END)
+        self.output_area.insert(tk.END, "✨ CÓDIGO CORREGIDO POR IA:\n", "correccion")
+        self.output_area.insert(tk.END, "─" * 40 + "\n", "linea")
+        self.output_area.insert(tk.END, codigo_corregido + "\n\n", "resultado")
+        self.output_area.insert(tk.END, f"🔄 Ejecutando código corregido (intento {siguiente_intento}/3)...\n\n", "ejecutando")
+        self.output_area.see(tk.END)
+        
+        self.corrigiendo = False
+        
+        if lenguaje == "python":
+            self.ejecutar_python_con_correccion(codigo_corregido, siguiente_intento)
+        elif lenguaje == "javascript":
+            self.ejecutar_javascript_con_correccion(codigo_corregido, siguiente_intento)
+        elif lenguaje == "bash":
+            self.ejecutar_bash_con_correccion(codigo_corregido, siguiente_intento)
+    
+    def _reintentar_con_mismo_error(self, codigo, lenguaje, error_msg, intento):
+        self.corrigiendo = False
+        if intento < 3:
+            self.output_area.delete("1.0", tk.END)
+            self.output_area.insert(tk.END, f"⚠️ La IA no pudo corregir en el intento {intento}\n", "error")
+            self.output_area.insert(tk.END, f"Reintentando con más contexto...\n\n", "ejecutando")
+            self.output_area.see(tk.END)
+            
+            if lenguaje == "python":
+                self.ejecutar_python_con_correccion(codigo, intento + 1)
+            elif lenguaje == "javascript":
+                self.ejecutar_javascript_con_correccion(codigo, intento + 1)
+            elif lenguaje == "bash":
+                self.ejecutar_bash_con_correccion(codigo, intento + 1)
+        else:
+            self._mostrar_error_sin_correccion(error_msg)
+    
+    def _mostrar_error_sin_correccion(self, error_msg):
+        self.output_area.delete("1.0", tk.END)
+        self.output_area.insert(tk.END, "❌ ERROR:\n", "error")
+        self.output_area.insert(tk.END, "─" * 40 + "\n", "linea")
+        self.output_area.insert(tk.END, error_msg + "\n\n", "error")
+        self.output_area.insert(tk.END, "⚠️ La IA no pudo corregir el código después de 3 intentos.\n", "error")
+        self.output_area.insert(tk.END, "Posibles soluciones:\n", "info")
+        self.output_area.insert(tk.END, "1. Revisa que la lógica del código original sea correcta\n", "info")
+        self.output_area.insert(tk.END, "2. Intenta una conversión más específica\n", "info")
+        self.output_area.insert(tk.END, "3. Verifica que tu API Key tenga acceso al modelo\n", "info")
+        self.output_area.see(tk.END)
+        self.corrigiendo = False
+    
+    def ejecutar_html(self, codigo):
+        self.output_area.delete("1.0", tk.END)
+        self.output_area.insert(tk.END, "🌐 VISTA PREVIA HTML:\n", "titulo")
+        self.output_area.insert(tk.END, "─" * 40 + "\n", "linea")
+        
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False, encoding='utf-8') as f:
+                f.write(codigo)
+                temp_file = f.name
+            
+            import webbrowser
+            webbrowser.open(f'file://{temp_file}')
+            
+            self.output_area.insert(tk.END, f"✅ HTML guardado temporalmente y abierto en el navegador\n", "resultado")
+            self.output_area.insert(tk.END, f"📁 Archivo temporal: {temp_file}\n\n", "resultado")
+            
+        except Exception as e:
+            self.output_area.insert(tk.END, f"❌ Error al abrir HTML: {str(e)}\n", "error")
+        
+        self.output_area.insert(tk.END, "\n📝 CONTENIDO HTML:\n", "titulo")
+        self.output_area.insert(tk.END, "─" * 40 + "\n", "linea")
+        self.output_area.insert(tk.END, codigo + "\n", "resultado")
+        self.output_area.see(tk.END)
+    
+    def ejecutar_generico(self, codigo, lenguaje):
+        self.output_area.delete("1.0", tk.END)
+        self.output_area.insert(tk.END, f"⚠️ EJECUCIÓN PARA {lenguaje.upper()}:\n", "titulo")
+        self.output_area.insert(tk.END, "─" * 40 + "\n", "linea")
+        self.output_area.insert(tk.END, f"\n📝 Para ejecutar código {lenguaje}:\n", "resultado")
+        self.output_area.insert(tk.END, f"1. Guarda el archivo con extensión .{lenguaje}\n", "resultado")
+        self.output_area.insert(tk.END, f"2. Ejecútalo con el intérprete correspondiente\n\n", "resultado")
+        self.output_area.insert(tk.END, "📝 CÓDIGO ACTUAL:\n", "titulo")
+        self.output_area.insert(tk.END, "─" * 40 + "\n", "linea")
+        self.output_area.insert(tk.END, codigo + "\n", "resultado")
+        self.output_area.see(tk.END)
+    
+    def limpiar_salida(self):
+        self.output_area.delete("1.0", tk.END)
+        self.output_area.insert(tk.END, "✅ Listo para ejecutar código...\n")
+    
+    def copiar_codigo(self):
+        codigo = self.code_editor.get("1.0", tk.END).strip()
+        try:
+            pyperclip.copy(codigo)
+            self.output_area.insert(tk.END, "✅ Código copiado al portapapeles\n")
+            self.output_area.see(tk.END)
+        except:
+            self.parent.clipboard_clear()
+            self.parent.clipboard_append(codigo)
+            self.output_area.insert(tk.END, "✅ Código copiado al portapapeles\n")
+            self.output_area.see(tk.END)
+    
+    def guardar_codigo(self):
+        codigo = self.code_editor.get("1.0", tk.END).strip()
+        lenguaje = self.lenguaje_actual
+        
+        extensiones = {
+            "python": ".py", "javascript": ".js", "bash": ".sh",
+            "html": ".html", "css": ".css", "json": ".json",
+            "sql": ".sql", "java": ".java", "cpp": ".cpp",
+            "csharp": ".cs", "php": ".php", "ruby": ".rb", "go": ".go"
+        }
+        
+        extension = extensiones.get(lenguaje, ".txt")
+        nombre_archivo = f"codigo_{datetime.now().strftime('%Y%m%d_%H%M%S')}{extension}"
+        
+        archivo = filedialog.asksaveasfilename(
+            defaultextension=extension,
+            initialfile=nombre_archivo,
+            filetypes=[(f"{lenguaje.upper()} files", f"*{extension}"), ("Todos los archivos", "*.*")]
+        )
+        
+        if archivo:
+            try:
+                with open(archivo, "w", encoding="utf-8") as f:
+                    f.write(codigo)
+                self.output_area.insert(tk.END, f"✅ Guardado: {os.path.basename(archivo)}\n")
+                self.output_area.see(tk.END)
+            except Exception as e:
+                self.output_area.insert(tk.END, f"❌ Error al guardar: {str(e)}\n", "error")
+                self.output_area.see(tk.END)
+    
+    def salir(self):
+        self.frame.destroy()
+        if self.on_close:
+            self.on_close()
+
+# ==================================================
+# VENTANA DE CONFIGURACIÓN DE CHAT (COMPLETA)
+# ==================================================
+
+class VentanaConfiguracionChat:
+    def __init__(self, parent, callback):
+        self.parent = parent
+        self.callback = callback
+        
+        self.ventana = tk.Toplevel(parent)
+        self.ventana.title("Configurar Nuevo Chat")
+        self.ventana.geometry("580x650")
+        self.ventana.configure(bg="#1e1e2e")
+        self.ventana.transient(parent)
+        self.ventana.grab_set()
+        
+        main_frame = tk.Frame(self.ventana, bg="#1e1e2e")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        canvas = tk.Canvas(main_frame, bg="#1e1e2e", highlightthickness=0)
+        scrollbar = tk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = tk.Frame(canvas, bg="#1e1e2e")
+        
+        scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw", width=560)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        def on_mousewheel(event):
+            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        canvas.bind_all("<MouseWheel>", on_mousewheel)
+        
+        tk.Label(scrollable_frame, text="✨ Configurar Nuevo Chat", font=("Segoe UI", 16, "bold"),
+                bg="#1e1e2e", fg="#50fa7b").pack(pady=15)
+        
+        tk.Label(scrollable_frame, text="📝 Nombre del chat:", font=("Segoe UI", 11),
+                bg="#1e1e2e", fg="#e0e0e0").pack(anchor=tk.W, pady=(10, 5))
+        self.nombre_entry = tk.Entry(scrollable_frame, font=("Segoe UI", 11),
+                                      bg="#3d3d4d", fg="white", width=40)
+        self.nombre_entry.pack(pady=5, padx=10, fill=tk.X)
+        
+        tk.Label(scrollable_frame, text="🤖 Proveedor de IA:", font=("Segoe UI", 11),
+                bg="#1e1e2e", fg="#e0e0e0").pack(anchor=tk.W, pady=(15, 5))
+        self.proveedor_var = tk.StringVar(value="gemini")
+        proveedor_frame = tk.Frame(scrollable_frame, bg="#1e1e2e")
+        proveedor_frame.pack(pady=5, padx=10, fill=tk.X)
+        for key, info in PROVEEDORES.items():
+            tk.Radiobutton(proveedor_frame, text=info["nombre"], variable=self.proveedor_var,
+                          value=key, bg="#1e1e2e", fg="#e0e0e0", selectcolor="#2d2d3d",
+                          anchor=tk.W).pack(anchor=tk.W, padx=10, pady=2)
+        
+        tk.Label(scrollable_frame, text="🧠 Modelo de IA (opcional):", font=("Segoe UI", 11),
+                bg="#1e1e2e", fg="#e0e0e0").pack(anchor=tk.W, pady=(15, 5))
+        self.modelo_entry = tk.Entry(scrollable_frame, font=("Segoe UI", 11),
+                                      bg="#3d3d4d", fg="white", width=40)
+        self.modelo_entry.pack(pady=5, padx=10, fill=tk.X)
+        tk.Label(scrollable_frame, text="Deja vacío para usar el modelo por defecto", 
+                bg="#1e1e2e", fg="#8b949e", font=("Segoe UI", 9)).pack(anchor=tk.W, padx=10)
+        
+        tk.Label(scrollable_frame, text="🎭 Emoción de la IA:", font=("Segoe UI", 11, "bold"),
+                bg="#1e1e2e", fg="#ffb86c").pack(anchor=tk.W, pady=(15, 5))
+        
+        self.emocion_var = tk.StringVar(value="Neutral")
+        emociones_frame = tk.Frame(scrollable_frame, bg="#1e1e2e")
+        emociones_frame.pack(pady=5, padx=10, fill=tk.X)
+        
+        emociones = ["Neutral", "Feliz 😊", "Triste 😢", "Enojado 😠", "Emocionado 🤩", 
+                    "Serio 😐", "Sarcástico 😏", "Paciente 🧘", "Creativo 🎨", "Analítico 🔍"]
+        
+        for i, emocion in enumerate(emociones):
+            row = i // 2
+            col = i % 2
+            tk.Radiobutton(emociones_frame, text=emocion, variable=self.emocion_var,
+                          value=emocion, bg="#1e1e2e", fg="#e0e0e0", 
+                          selectcolor="#2d2d3d", anchor=tk.W).grid(row=row, column=col, 
+                                                       sticky=tk.W, padx=20, pady=3)
+        
+        tk.Label(scrollable_frame, text="🎯 Propósitos de la IA (puedes elegir varios):", 
+                font=("Segoe UI", 11, "bold"),
+                bg="#1e1e2e", fg="#ffb86c").pack(anchor=tk.W, pady=(15, 5))
+        
+        self.propositos_vars = {}
+        propositos_frame = tk.Frame(scrollable_frame, bg="#1e1e2e")
+        propositos_frame.pack(pady=5, padx=10, fill=tk.X)
+        
+        propositos = [
+            "🎮 Videojuegos", "💻 Programación", "📖 Lores/Fandoms", 
+            "🔬 Experimentos", "🎨 Diseño", "📝 Escritura", 
+            "🎵 Música", "🎬 Cine/TV", "🧠 Psicología", 
+            "💰 Finanzas", "🏥 Salud", "📚 Educación", 
+            "🤖 IA/ML", "🔒 Ciberseguridad", "🌍 General"
+        ]
+        
+        for i, proposito in enumerate(propositos):
+            row = i // 2
+            col = i % 2
+            var = tk.BooleanVar(value=False)
+            self.propositos_vars[proposito] = var
+            tk.Checkbutton(propositos_frame, text=proposito, variable=var,
+                          bg="#1e1e2e", fg="#e0e0e0", selectcolor="#2d2d3d",
+                          anchor=tk.W).grid(row=row, column=col, sticky=tk.W, padx=20, pady=3)
+        
+        tk.Label(scrollable_frame, text="🔑 API Key:", font=("Segoe UI", 11),
+                bg="#1e1e2e", fg="#e0e0e0").pack(anchor=tk.W, pady=(15, 5))
+        self.api_entry = tk.Entry(scrollable_frame, font=("Segoe UI", 11),
+                                   bg="#3d3d4d", fg="white", width=40, show="*")
+        self.api_entry.pack(pady=5, padx=10, fill=tk.X)
+        
+        tk.Button(scrollable_frame, text="✨ Crear Chat", command=self.crear_chat,
+                 bg="#50fa7b", fg="#1e1e2e", font=("Segoe UI", 12, "bold"),
+                 padx=30, pady=10, relief=tk.FLAT, cursor="hand2").pack(pady=25)
+        
+        tk.Frame(scrollable_frame, height=20, bg="#1e1e2e").pack()
+    
+    def crear_chat(self):
+        nombre = self.nombre_entry.get().strip() or "Chat sin nombre"
+        proveedor = self.proveedor_var.get()
+        modelo = self.modelo_entry.get().strip() or PROVEEDORES[proveedor]["default_model"]
+        api_key = self.api_entry.get().strip()
+        emocion = self.emocion_var.get()
+        
+        propositos_seleccionados = [p for p, var in self.propositos_vars.items() if var.get()]
+        if not propositos_seleccionados:
+            propositos_seleccionados = ["🌍 General"]
+        
+        if not api_key:
+            messagebox.showerror("Error", "Debes ingresar una API Key")
+            return
+        
+        self.callback(nombre, proveedor, modelo, api_key, emocion, propositos_seleccionados)
+        self.ventana.destroy()
+
+# ==================================================
+# CONTROL DE PRIMERA EJECUCIÓN (SPLASH SOLO UNA VEZ)
+# ==================================================
+FIRST_RUN_FLAG = os.path.join(APPDATA_DIR, "hydra_first_run.flag")
+
+def es_primera_ejecucion():
+    """Devuelve True si es la primera vez que se ejecuta el programa."""
+    return not os.path.exists(FIRST_RUN_FLAG)
+
+def marcar_primera_ejecucion_completada():
+    """Crea el archivo de flag para indicar que ya no es la primera vez."""
+    with open(FIRST_RUN_FLAG, "w") as f:
+        f.write(datetime.now().isoformat())
+
+def mostrar_splash():
+    """Muestra una ventana pequeña de carga con barra de progreso simulada (solo primera vez)."""
+    splash = tk.Tk()
+    splash.title("Hydra Creator")
+    splash.geometry("400x150")
+    splash.resizable(False, False)
+    splash.configure(bg="#1e1e2e")
+    
+    # Centrar la ventana
+    splash.update_idletasks()
+    x = (splash.winfo_screenwidth() // 2) - (400 // 2)
+    y = (splash.winfo_screenheight() // 2) - (150 // 2)
+    splash.geometry(f"400x150+{x}+{y}")
+    
+    estilo = ttk.Style()
+    estilo.theme_use('clam')
+    estilo.configure("TProgressbar", thickness=20, background="#50fa7b", troughcolor="#2d2d3d")
+    
+    lbl_titulo = tk.Label(splash, text="Preparando Hydra Creator...", font=("Segoe UI", 12, "bold"),
+                          bg="#1e1e2e", fg="#50fa7b")
+    lbl_titulo.pack(pady=(20, 10))
+    
+    progress = ttk.Progressbar(splash, length=300, mode='determinate', style="TProgressbar")
+    progress.pack(pady=10)
+    
+    lbl_estado = tk.Label(splash, text="Cargando...", font=("Segoe UI", 10),
+                          bg="#1e1e2e", fg="#e0e0e0")
+    lbl_estado.pack()
+    
+    # Simulación de progreso (no se descarga nada real)
+    def actualizar_progreso(actual=0, incremento=10):
+        if actual < 100:
+            nuevo = min(actual + incremento, 100)
+            progress['value'] = nuevo
+            lbl_estado.config(text=f"{nuevo}% completado")
+            splash.update()
+            splash.after(50, actualizar_progreso, nuevo, incremento)
+        else:
+            splash.destroy()
+            # Marcar que ya no es primera ejecución
+            marcar_primera_ejecucion_completada()
+            lanzar_aplicacion()
+    
+    splash.after(100, actualizar_progreso)
+    splash.mainloop()
+
+def lanzar_aplicacion():
+    """Instancia y ejecuta la aplicación principal HydraCreator."""
+    root = tk.Tk()
+    app = HydraCreator(root)
+    root.mainloop()
+
+# ==================================================
+# PUNTO DE ENTRADA PRINCIPAL MODIFICADO
+# ==================================================
+if __name__ == "__main__":
+    if es_primera_ejecucion():
+        mostrar_splash()
+    else:
+        lanzar_aplicacion()
